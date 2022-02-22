@@ -1,0 +1,1071 @@
+#!/usr/bin/env bash
+# 
+# alertctl is a CLI tool that manages alert definitions using the Devo Alerting API. 
+# You can create, update, list, delete, enable, and disable alert definitions 
+# in a Devo domain, or copy them over to another domain.
+#
+#
+# Required packages:
+#
+# - bash v4+
+# - jq
+# - curl
+#
+#
+# USER CONFIGURATION:
+# 
+# It should be provided in a JSON file. Example config:
+#
+# {
+#   "cloud": "us",
+#   "token": "MY-MAIN-DEVO-TOKEN",
+#   "domain": "my_main_domain",
+#   "targetToken": "DEVO-TOKEN-TO-COPY-ALERTS",
+#   "targetDomain": "my_target_domain"
+# }  
+#
+# Config search paths sorted by priority:
+#
+# 1. Path to config file specified by --config or -c option.
+# 2. config.json in the same directory.
+# 3. .devo.json or .config/devo.json in the user home directory. 
+# 4. Embedded config (not recommended).
+#
+# Required variables:
+# - cloud         -> Devo cloud [us, eu, es, saas, ca, sasr]
+# - token         -> Devo token associated with your Devo domain
+# - targetToken   -> Devo token from the domain where alerts will be copied to (only required to copy alerts)
+#
+# Optional variables (but recommended):
+# - domain
+# - targetDomain
+#
+# If the domain or targetDomain are not provided, they'll be fetched using their respective tokens. 
+# An unsuccessful attempt will assign a default value of 'unknown'. Both domains are only informational,
+# they don't change the functionality.
+#
+#
+# Devo Alerting API documenation: 
+# https://docs.devo.com/confluence/ndt/latest/api-reference/alerting-api
+#
+#
+#/ Version:  1.0.0
+#/ Author:   Roberto Meléndez  [Cambridge, USA]
+#/ GitHub:   https://github.com/rcmelendez/devo-alerting-api
+#/ Contact:  @rcmelendez on LinkedIn, Medium, and GitHub
+#/ Released: Feb 22, 2022
+
+
+set -euo pipefail
+
+
+declare -r PROGRAM="${0##*/}"
+
+
+declare -r COL_NC='\e[0m'
+declare -r COL_LIGHT_GREEN='\e[0;32m'
+declare -r COL_LIGHT_RED='\e[0;31m'
+declare -r COL_BOLD_GREEN='\e[1;32m'
+declare -r COL_BOLD_RED='\e[1;31m'
+declare -r COL_BOLD_WHITE='\e[1;37m'
+declare -r TICK="[${COL_BOLD_GREEN}✓${COL_NC}]"
+declare -r CROSS="[${COL_BOLD_RED}✗${COL_NC}]"
+declare -r INFO="[i]"
+
+
+DEVO_CLOUD="${DEVO_CLOUD-}"
+DEVO_TOKEN="${DEVO_TOKEN-}"
+DEVO_DOMAIN="${DEVO_DOMAIN-}"
+DEVO_TARGET_TOKEN="${DEVO_TARGET_TOKEN-}"
+DEVO_TARGET_DOMAIN="${DEVO_TARGET_DOMAIN-}"
+
+
+error() {
+  echo -e "${CROSS}" "ERROR:" "${1}" >&2
+}
+ 
+
+# Check if jq is installed
+if [[ -z "$(command -v jq)" ]]; then 
+  error "Unable to find 'jq'. Please install it with your package manager:"
+  echo -e "Ubuntu: sudo apt install jq\nCentOS: sudo [yum|dnf] install jq\nmacOS:  brew install jq" && exit 1
+fi
+
+
+# Bash v4 or higher
+if (( BASH_VERSINFO[0] < 4 )); then 
+  error "Outdated Bash version. At least Bash 4.0 is required." && exit 1
+fi
+
+
+# Auxiliary functions
+get_length() {
+  echo "${1}" | jq '. | length'
+}
+
+
+has_length() {
+  local length
+  length=$(get_length "${1}")
+  if (( length == 0 )); then 
+    results_msg "${length}" && return 1
+  fi  
+}
+
+
+valid_file() {
+  if [[ ! -e "${1}" ]]; then
+    error "File '${1}' does not exist." 
+  elif [[ ! -s "${1}" ]]; then 
+    error "File '${1}' cannot be empty." 
+  else 
+    return 0  
+  fi
+  return 1  
+}
+
+
+valid_json() {
+  if jq empty "${1}" 2>/dev/null; then
+    return 0
+  else
+    error "Invalid JSON format. Please check the JSON syntax and try again." && exit 1
+  fi  
+}
+
+
+read_keys() {
+  jq -e 'has("cloud")' "${1}" >/dev/null 2>&1 && DEVO_CLOUD=$(jq -r '.cloud' "${1}")
+  jq -e 'has("token")' "${1}" >/dev/null 2>&1 && DEVO_TOKEN=$(jq -r '.token' "${1}")
+  jq -e 'has("domain")' "${1}" >/dev/null 2>&1 && DEVO_DOMAIN=$(jq -r '.domain' "${1}")
+  jq -e 'has("targetToken")' "${1}" >/dev/null 2>&1 && DEVO_TARGET_TOKEN=$(jq -r '.targetToken' "${1}")
+  jq -e 'has("targetDomain")' "${1}" >/dev/null 2>&1 && DEVO_TARGET_DOMAIN=$(jq -r '.targetDomain' "${1}")
+}
+
+
+read_config_from_dir() {
+  local file='devo.json'
+  if [[ -e "${HOME}/.config/${file}" ]]; then
+    jq empty "${HOME}/.config/${file}" 2>/dev/null && read_keys "${HOME}/.config/${file}"
+  fi
+  if [[ -e "${HOME}/.${file}" ]]; then
+    jq empty "${HOME}/.${file}" 2>/dev/null && read_keys "${HOME}/.${file}"
+  fi
+  # config.json takes precedence
+  if [[ -e "${PWD}/config.json" ]]; then
+    jq empty "${PWD}/config.json" 2>/dev/null && read_keys "${PWD}/config.json"
+  fi
+}
+
+
+can_get_domain() {
+    # The Query API will throw a permissions error if the token is not authorized to
+    # access the table devo.internal.collector.consumptions to retrieve the Devo domain.
+  if echo "${1}" | jq -e 'has("error")' >/dev/null 2>&1; then 
+    # Assign 'unknown' by default
+    echo "unknown" && return 1
+  fi
+}
+
+
+get_domain_from_token() {
+  local query post
+  query='{"query": "from devo.internal.collector.consumptions group by domain", "from": "3d","to": "now", "mode": {"type": "json/simple"}}'
+  post=$(curl -sS --connect-timeout 10 \
+                 -X POST "https://apiv2-${DEVO_CLOUD}.devo.com/search/query" \
+                 -H "Authorization: Bearer ${1}" \
+                 -H "Content-Type: application/json" \
+                 -d ''"${query}"'' 2>&1)
+  # Confirm if the Query API endpoint works
+  if [[ "${post}" =~ "curl:" ]]; then
+    error "${post}" && exit 1
+  elif can_get_domain "${post}"; then 
+    echo "${post}" | jq -r '.domain'
+  fi
+}
+
+
+# 1st attempt to retrieve the Devo domain
+get_domain_from_alerts() {
+  local allAlerts myAlerts
+  allAlerts=$(curl -sS --connect-timeout 10 \
+                   -X GET "${ALERTS_ENDPOINT}${PAGE}" \
+                   -H "standAloneToken: ${1}" \
+                   -H "Content-Type: application/json")
+  if [[ $(get_length "${allAlerts}") -gt 0 ]]; then
+    myAlerts=$(echo "${allAlerts}" | jq 'map(select(.subcategory | startswith("lib.my.")))')
+    if [[ -n "${myAlerts}" && "${myAlerts}" != "[]" ]]; then
+      echo "${myAlerts}" | jq '.[0].alertCorrelationContext.nameId' | awk -F . '{print $3}'
+    else 
+      get_domain_from_token "${1}"
+    fi
+  else 
+    # 2nd attempt
+    get_domain_from_token "${1}"
+  fi  
+}
+
+
+has_target_domain() {
+  if [[ -z "${DEVO_TARGET_DOMAIN}" ]]; then
+    if [[ -z "${DEVO_TARGET_TOKEN}" ]]; then
+      empty_token "targetToken"
+    else
+      DEVO_TARGET_DOMAIN=$(get_domain_from_alerts "${DEVO_TARGET_TOKEN}")
+    fi
+  fi
+}
+
+
+# Info messages functions
+start_msg() {
+  if [[ "${1}" == "Listing" ]]; then
+    echo -e "${INFO} ${1} ${2} alert ${3} in domain '${DEVO_DOMAIN}'..."
+  else 
+    echo -e "${INFO} ${1} ${2} alert definitions in domain '${DEVO_DOMAIN}'..."
+  fi
+}
+
+
+start_msg_param() {
+  if [[ "${1}" == "Listing" ]]; then
+    echo -e "${INFO} ${1} alert ${2} with ${3} '${4}' in domain '${DEVO_DOMAIN}'..."
+  else 
+    echo -e "${INFO} ${1} alert definitions with ${2} '${3}' in domain '${DEVO_DOMAIN}'..."
+  fi  
+}
+
+
+results_msg() {
+  if [[ "${1}" -eq 0 ]]; then
+    echo -e "${CROSS} No alert definitions found in domain '${DEVO_DOMAIN}'."
+  else  
+    echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} alert ${2} found in domain '${DEVO_DOMAIN}'.${COL_NC}"
+  fi  
+}
+
+
+results_msg_param() {
+  local msg='definition'
+  if [[ "${1}" -eq 0 ]]; then
+    echo -e "${CROSS} No alert definitions with ${2} '${3}' found in domain '${DEVO_DOMAIN}'."
+  else
+    [[ "${1}" -gt 1 ]] && msg='definitions' 
+    echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} alert ${msg} with ${2} '${3}' found in domain '${DEVO_DOMAIN}'.${COL_NC}"
+  fi
+}
+
+
+results_msg_search() {
+  local msg='definition'
+  [[ "${1}" -gt 1 ]] && msg='definitions'
+  echo -e "${TICK} ${1} alert ${msg} found in domain '${DEVO_DOMAIN}':"
+}
+
+
+results_msg_subcategories() {
+  echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} subcategor${2} found in domain '${DEVO_DOMAIN}'.${COL_NC}"
+}
+
+
+# Error functions
+invalid_param() {
+  error "${1} not provided. To filter alerts by this parameter, please enter a valid String (case insensitive)."  
+}
+
+
+invalid_option() {
+  error "Invalid option '${1}'."
+  echo "Try '${PROGRAM} ${2} --help' for more information."
+  exit 1
+}
+
+
+empty_string() {
+  case "${1}" in
+    s )
+      invalid_param "Subcategory"
+      echo -e "\nExample:\n${PROGRAM} ${2} --subcategory \"Network Monitoring\""
+      exit 1
+      ;;
+    n )
+      invalid_param "Alert name"
+      echo -e "\nExample:\n${PROGRAM} ${2} --name \"Invalid User\""
+      exit 1
+      ;;
+    f ) 
+      error "File name not provided. To create/update an alert, please enter a file name that contains the alert definition."
+      echo -e "\nExample:\n${PROGRAM} ${2} --file new_alert.json"
+      exit 1
+      ;;
+  esac
+}
+
+
+empty_number() {
+  error "Alert ID not provided. Please enter a valid number."
+  echo -e "\nExample:\n${PROGRAM} ${1} --id 169820"
+  exit 1
+}
+
+
+has_nondigits() {
+  if [[ "${1}" =~ [^[:digit:]] ]]; then
+    error "Invalid alert ID '${1}'. Alert IDs can only have numbers."
+    echo -e "\nExample:\n${PROGRAM} ${2} --id 169820"
+    return 1
+  fi
+}
+
+
+empty_token() {
+  error "No token was found. Please set a valid Devo '${1}' value in your JSON config file." && exit 1
+} 
+
+
+invalid_cloud() {
+  error "Invalid Devo environment. Please set a valid 'cloud' value in your JSON config file: [us, eu, es, saas, ca, sasr]." && exit 1
+}
+
+
+# Core functions
+get_all_alerts() {
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_ENDPOINT}${PAGE}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"    
+}
+
+
+get_active_alerts() {
+  get_all_alerts | jq 'map(select(.isActive=='"${1}"'))'
+}
+
+
+get_favorite_alerts() {
+  get_all_alerts | jq 'map(select(.isFavorite==true))'
+}
+
+
+get_alerts_by_name() {
+  local nameFilter
+  # Encode the name to URL-encoded format in case of non-alphanumeric characters
+  nameFilter=$(printf %s "${1}" | jq -sRr @uri) 
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_ENDPOINT}?nameFilter=${nameFilter}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"
+}
+
+
+get_alerts_by_subcategory() {
+  # Make the search case insensitive
+  get_all_alerts | jq 'map(select(.subcategory | test("'"${1}"'"; "i")))'
+}
+
+
+get_alert_by_id() {
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_ENDPOINT}?idFilter=${1}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"  
+}
+
+
+# Config function
+read_config() {
+  if valid_file "${1}" && valid_json "${1}"; then
+    read_keys "${1}"
+  fi
+}
+
+
+# Get functions
+get_alert_definitions() {
+  local msg='definition' length
+  length=$(get_length "${1}")
+  if has_length "${1}"; then  
+    echo "${1}" | jq '.'
+    if (( $# < 2 )); then
+      (( length > 1 )) && msg='definitions'
+      results_msg "${length}" "${msg}"
+    else
+      results_msg_param "${length}" "${2}" "${3}"
+    fi
+  fi
+}
+
+
+get_alert_names() {
+  local msg='name' length
+  length=$(get_length "${1}")
+  if has_length "${1}"; then  
+    echo "${1}" | jq -r '.[] | .name'
+    (( length > 1 )) && msg='names'
+    results_msg "${length}" "${msg}"  
+  fi
+}
+
+
+get_subcategory_names() {
+  local subcategory suffix='y'
+  if has_length "${1}"; then  
+    subcategory=$(echo "${1}" | jq -r 'unique_by(.subcategory) | .[].subcategory' | awk -F . '{print $4}' | tee /dev/tty)
+    subcategory=$(echo "${subcategory}" | wc -l | xargs)
+    (( subcategory > 1 )) && suffix='ies'   
+    results_msg_subcategories "${subcategory}" "${suffix}"  
+  fi
+}
+
+
+# Create/update function
+apply_alert() {
+  local method='POST' msg='creat' stdout
+  if valid_file "${1}" && valid_json "${1}"; then
+    if jq -e 'has("id")' "${1}" >/dev/null 2>&1; then
+      method='PUT' msg='updat'
+    fi
+    echo -e "${INFO} ${msg^}ing alert definition..."
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X "${method}" "${ALERTS_ENDPOINT}" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d @"${1}" | tee /dev/tty)
+    if echo "${stdout}" | jq -e 'has("error")' >/dev/null 2>&1; then
+       echo -e "\n\n${CROSS} ${COL_LIGHT_RED}Failed to ${msg}e alert definition.${COL_NC}" 
+    else  
+      echo -e "\n\n${TICK} ${COL_LIGHT_GREEN}Alert definition successfully ${msg}ed.${COL_NC}"
+    fi
+  fi  
+}
+
+
+# Copy functions
+post_alerts() { 
+  local length count=1 payload alertName stdout err=0
+  length=$(get_length "${1}")
+  # base64 encode each JSON object
+  for row in $(echo "${1}" | jq -r '.[] | @base64'); do
+    _jq() {
+      echo "${row}" | base64 -d | jq -r "${1}"
+    }
+    payload=$(_jq '.')
+    alertName=$(_jq '.name')
+    echo -e "${INFO} Creating alert definition '${COL_BOLD_WHITE}${alertName}${COL_NC}'... [${count}/${length}]"
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X POST "${ALERTS_ENDPOINT}" \
+                  -H "standAloneToken: ${DEVO_TARGET_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d ''"${payload}"'' | tee /dev/tty)
+    if echo "${stdout}" | jq -e 'has("error")' >/dev/null 2>&1; then 
+      (( err++ )) || true
+    fi  
+    echo -e "\n"
+    (( count++ )) || true
+  done
+  echo -e  "${INFO} Alerts processed:  ${length}"
+  echo -e  "${TICK} ${COL_LIGHT_GREEN}Alerts created:    $(( length - err ))${COL_NC}"
+  echo -e "${CROSS} ${COL_LIGHT_RED}Alerts failed:     ${err}${COL_NC}" 
+}
+
+
+clean() {
+  local alertDefinitions
+  # Delete all non-required keys
+  alertDefinitions=$(echo "${1}" | jq 'map(select(.subcategory | contains("lib.my.")) | 
+                                       del(.id,.creationDate,.categoryId,.subcategoryId,.isActive,.isFavorite,
+                                       .isAlertChain,.alertCorrelationContext.id,.alertCorrelationContext.nameId,
+                                       .alertCorrelationContext.ownerEmail,.actionPolicyId[]))')
+  # Remove 'lib.my.<domain>' from subcategory
+  # shellcheck disable=SC2001
+  echo "${alertDefinitions}" | sed -e 's/"subcategory": "lib.my.'"${DEVO_DOMAIN}"'./"subcategory": "/g'
+}
+
+
+copy_alerts() {
+  local length msg='definition' answer
+  length=$(get_length "${1}")
+  # Check if a Devo 'targetToken' value was provided
+  has_target_domain     
+  if has_length "${1}"; then
+    results_msg_search "${length}"
+    echo "${1}" | jq -r '.[] | .name' && echo
+    (( length > 1 )) && msg='definitions'
+    read -rp "${INFO} Do you want to COPY the alert ${msg} over to domain '${DEVO_TARGET_DOMAIN}'? [y/N]: " answer
+    case "${answer:0:1}" in
+      y | Y )
+        post_alerts "$(clean "${1}")"
+        ;;
+      *) error "Operation aborted." && exit 1 ;;
+    esac
+  fi
+}
+
+
+# Delete function
+delete_alerts() {
+  local length alertIds msg='definition' answer
+  length=$(get_length "${1}")
+  if has_length "${1}"; then
+    for id in $(echo "${1}" | jq -r '.[] | @base64'); do
+      _jq() {
+        echo "${id}" | base64 -d | jq -r "${1}"
+      }
+      alertIds+="alertIds=$(_jq '.id')&"
+    done
+    alertIds="${alertIds::-1}"
+    results_msg_search "${length}"
+    echo "${1}" | jq -r '.[] | .name' && echo
+    (( length > 1 )) && msg='definitions'
+    read -rp "${INFO} Do you want to DELETE ${length} alert ${msg}? [y/N]: " answer
+    case "${answer:0:1}" in
+      y | Y )
+        echo -e "${TICK} Deleting alert ${msg}..."
+        curl -sS --connect-timeout 10 \
+             -X DELETE "${ALERTS_ENDPOINT}?${alertIds}" \
+             -H "standAloneToken: ${DEVO_TOKEN}" \
+             -H "Content-Type: application/json"
+        echo -e "${TICK} ${COL_LIGHT_GREEN}${length} alert ${msg} successfully deleted.${COL_NC}"
+        ;;
+      *) error "Operation aborted." && exit 1 ;;
+    esac
+  fi
+}
+
+
+# Enable/disable function
+enable_alerts() {
+  local bool=false prefix='dis' length alertIds msg='definition' answer
+  (( $# < 2 )) && bool=true prefix='en'
+  length=$(get_length "${1}")
+  if has_length "${1}"; then
+    for id in $(echo "${1}" | jq -r '.[] | @base64'); do
+      _jq() {
+        echo "${id}" | base64 -d | jq -r "${1}"
+      }
+      alertIds+="alertIds=$(_jq '.id')&"
+    done
+    alertIds="${alertIds}enable=${bool}"
+    results_msg_search "${length}"
+    echo "${1}" | jq -r '.[] | .name' && echo
+    (( length > 1 )) && msg='definitions'
+    read -rp "${INFO} Do you want to ${prefix^^}ABLE ${length} alert ${msg}? [y/N]: " answer
+    case "${answer:0:1}" in
+      y | Y )
+        echo -e "${TICK} ${prefix^}abling alert ${msg}..."
+        curl -sS --connect-timeout 10 \
+             -X PUT "${ALERTS_ENDPOINT}/status?${alertIds}" \
+             -H "standAloneToken: ${DEVO_TOKEN}" \
+             -H "Content-Type: application/json"
+        echo -e "${TICK} ${COL_LIGHT_GREEN}${length} alert ${msg} successfully ${prefix}abled.${COL_NC}"
+        ;;
+      *) error "Operation aborted." && exit 1 ;;
+    esac
+  fi    
+}
+
+
+# Help functions
+print_usage() {
+  cat << HEREDOC
+${PROGRAM} is a tool that manages alert definitions using the Devo Alerting API. 
+
+  USAGE: ${PROGRAM} [-c FILENAME] [COMMAND] [options]
+
+Commands:
+  get                       Get all or a subset of alert definitions
+  apply                     Create or update an alert definition
+  copy                      Copy all or a subset of alert definitions over to another Devo domain
+  delete                    Delete all or a subset of alert definitions
+  enable                    Enable all or a subset of alert definitions
+  disable                   Disable all or a subset of alert definitions
+
+Options:
+  -A, --all                 All alert definitions
+      --all-names           All alert names
+      --all-subcategories   All subcategories
+  -a, --active              Active alert definitions
+      --active-names        Active alert names
+  -i, --inactive            Inactive alert definitions
+      --inactive-names      Inactive alert names
+  -F, --favorite            Favorite alert definitions
+      --favorite-names      Favorite alert names
+  -f, --file FILENAME       Read an alert definition from JSON file
+  -n, --name STRING         Alert definitions filtered by name
+  -s, --subcategory STRING  Alert definitions filtered by subcategory
+      --id NUMBER           Alert definition filtered by its alert ID
+  -c, --config FILENAME     Read configuration from JSON file
+
+Other commands:
+  help                      Show help menu
+  version                   Show current version info
+
+HEREDOC
+}
+
+
+print_get_help() {
+  cat << GETCOMMAND
+Get all or a subset of alert definitions in a Devo domain.
+
+  USAGE: ${PROGRAM} [-c FILENAME] get [options] 
+
+Options:
+  -A, --all                 Get all alert definitions
+      --all-names           Get all alert names
+      --all-subcategories   Get all subcategories
+  -a, --active              Get active alert definitions
+      --active-names        Get active alert names
+  -i, --inactive            Get inactive alert definitions 
+      --inactive-names      Get inactive alert names  
+  -F, --favorite            Get favorite alert definitions
+      --favorite-names      Get favorite alert names
+  -n, --name STRING         Get alert definitions filtered by name  
+  -s, --subcategory STRING  Get alert definitions filtered by subcategory
+      --id NUMBER           Get an alert definition by its alert ID
+  -c, --config FILENAME     Read configuration from JSON file      
+  -h, --help                Show this menu
+
+Examples:
+# List all alert definitions
+${PROGRAM} get --all
+
+# Fetch only alert definitions where the alert name contains 'Critical Error'
+${PROGRAM} -c config.json get --name "Critical Error"
+
+# Get alert definitions where the subcategory contains 'My Alerts'
+${PROGRAM} get --subcategory "My Alerts"
+
+GETCOMMAND
+}
+
+
+print_apply_help() {
+  cat << APPLYCOMMAND
+Create or update an alert definition in a Devo domain.
+
+  USAGE: ${PROGRAM} [-c FILENAME] apply -f FILENAME 
+
+Options:
+  -f, --file FILENAME     Create/update an alert definition from JSON file
+  -c, --config FILENAME   Read configuration from JSON file
+  -h, --help              Show this menu
+
+Examples:
+# Create a new alert definition
+${PROGRAM} apply --file new_alert.json
+
+# Update an existing alert definition (alert ID required in JSON file)
+${PROGRAM} apply -f update_alert.json
+
+APPLYCOMMAND
+}
+
+
+print_copy_help() {
+  cat << COPYCOMMAND
+Copy all or a subset of alert definitions from one Devo domain to another.
+
+  USAGE: ${PROGRAM} [-c FILENAME] copy [options]
+
+Options:
+  -A, --all                 Copy all alert definitions
+  -a, --active              Copy active alert definitions
+  -i, --inactive            Copy inactive alert definitions
+  -F, --favorite            Copy favorite alert definitions
+  -n, --name STRING         Copy alert definitions filtered by name
+  -s, --subcategory STRING  Copy alert definitions filtered by subcategory
+      --id NUMBER           Copy an alert definition by its alert ID
+  -c, --config FILENAME     Read configuration from JSON file
+  -h, --help                Show this menu
+
+Examples:
+# Copy all alert definitions
+${PROGRAM} copy --all
+
+# Copy alert definitions where the alert name contains 'Malware Domains'
+${PROGRAM} -c config.json copy --name "Malware Domains"
+
+# Copy alert definitions where the subcategory contains 'Suspicious Activity'
+${PROGRAM} copy --subcategory "Suspicious Activity"
+
+COPYCOMMAND
+}
+
+
+print_delete_help() {
+  cat << DELETECOMMAND
+Delete all or a subset of alert definitions in a Devo domain.
+
+  USAGE: ${PROGRAM} [-c FILENAME] delete [options]
+
+Options:
+  -A, --all                 Delete all alert definitions
+  -a, --active              Delete active alert definitions
+  -i, --inactive            Delete inactive alert definitions
+  -F, --favorite            Delete favorite alert definitions
+  -n, --name STRING         Delete alert definitions filtered by name
+  -s, --subcategory STRING  Delete alert definitions filtered by subcategory
+      --id NUMBER           Delete an alert definition by its alert ID
+  -c, --config FILENAME     Read configuration from JSON file      
+  -h, --help                Show this menu
+
+Examples:
+# Delete all alert definitions
+${PROGRAM} delete --all
+
+# Delete inactive alerts
+${PROGRAM} delete --inactive
+
+# Delete alert definitions with "obsolete" in their names
+${PROGRAM} -c config.json delete --name "obsolete"
+
+DELETECOMMAND
+}
+
+
+# Help menu for enable/disable commands 
+print_enable_help() {
+  local prefix='dis' option='active  ' 
+  local comment=${option::-2}
+  (( $# == 0 )) && prefix='en' option='inactive' comment=${option}
+  cat << ENABLECOMMAND
+${prefix^}able all or a subset of alert definitions in a Devo domain.
+
+  USAGE: ${PROGRAM} [-c FILENAME] ${prefix}able [options] 
+
+Options:
+  -A, --all                 ${prefix^}able all alert definitions
+  -${option:0:1}, --${option}            ${prefix^}able ${comment} alert definitions
+  -n, --name STRING         ${prefix^}able alert definitions filtered by name  
+  -s, --subcategory STRING  ${prefix^}able alert definitions filtered by subcategory
+      --id NUMBER           ${prefix^}able an alert definition by its alert ID
+  -c, --config FILENAME     Read configuration from JSON file      
+  -h, --help                Show this menu
+
+Examples:
+# ${prefix^}able all alert definitions
+${PROGRAM} ${prefix}able --all
+
+# ${prefix^}able ${comment} alerts
+${PROGRAM} ${prefix}able --${option}
+
+ENABLECOMMAND
+}
+
+
+(( $# == 0 )) && print_usage && exit 1
+
+
+# Defaults
+command='get'
+quantity='all'
+alertType='definitions'
+param='subcategory'
+input=''
+
+
+read_config_from_dir
+
+
+while (( $# > 0 )); do
+  case "${1}" in
+    --config | -c ) read_config "${2}" && shift ;;
+    get )
+      case "${2:-}" in
+        --all | -A ) true ;;
+        --all-names )         alertType='names' ;;
+        --all-subcategories ) alertType='subcategories' ;;
+        --active | -a )       quantity='active' ;;
+        --active-names )      quantity='active' alertType='names' ;;
+        --inactive | -i )     quantity='inactive' ;;
+        --inactive-names )    quantity='inactive' alertType='names' ;;  
+        --favorite | -F )     quantity='favorite' ;;
+        --favorite-names )    quantity='favorite' alertType='names' ;;
+        --subcategory | -s )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "s" "get"
+          else  
+            command='get-param' input="${3}"
+          fi
+          shift
+          ;;
+        --name | -n )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "get"
+          else
+            command='get-param' param='name' input="${3}"
+          fi
+          shift 
+          ;;
+        --id )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_number "get"
+          else
+            if has_nondigits "${3}" "get"; then
+              command='get-param' alertType='definition' param='ID' input="${3}"
+            else 
+              exit 1  
+            fi  
+          fi
+          shift
+          ;;  
+        "" ) print_get_help && exit 1 ;;
+        --help | -h ) print_get_help && exit 0 ;;
+        *) invalid_option "${2}" "get" ;;   
+      esac
+      shift
+      ;;
+    apply )
+      command='apply'
+      case "${2:-}" in
+        --file | -f )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "f" "apply"
+          else
+            file="${3}"
+          fi
+          shift
+          ;;  
+        "" ) print_apply_help && exit 1 ;;
+        --help | -h ) print_apply_help && exit 0 ;;
+        *) invalid_option "${2}" "apply" ;; 
+      esac
+      shift  
+      ;;
+    copy )
+      command='copy'
+      case "${2:-}" in  
+        --all | -A ) true ;;
+        --active | -a )   quantity='active' ;;
+        --inactive | -i ) quantity='inactive' ;;
+        --favorite | -F ) quantity='favorite' ;;
+        --subcategory | -s )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "s" "copy"
+          else
+            command='copy-param' input="${3}"
+          fi
+          shift
+          ;;
+        --name | -n )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "copy"
+          else
+            command='copy-param' param='name' input="${3}"
+          fi
+          shift
+          ;;
+        --id )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_number "copy"
+          else
+            if has_nondigits "${3}" "copy"; then
+              command='copy-param' param='ID' input="${3}"
+            else 
+              exit 1  
+            fi
+          fi
+          shift
+          ;;          
+        "" ) print_copy_help && exit 1 ;;
+        --help | -h ) print_copy_help && exit 0 ;;
+        *) invalid_option "${2}" "copy" ;;   
+      esac
+      shift      
+      ;;
+    delete )
+      command='delete'
+      case "${2:-}" in
+        --all | -A ) true ;;
+        --active | -a )   quantity='active' ;;
+        --inactive | -i ) quantity='inactive' ;;
+        --favorite | -F ) quantity='favorite' ;;
+        --subcategory | -s ) 
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "delete"
+          else
+            command='delete-param' input="${3}"
+          fi
+          shift
+          ;;
+        --name | -n ) 
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "delete"
+          else
+            command='delete-param' param='name' input="${3}"
+          fi
+          shift
+          ;;
+        --id )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_number "delete"
+          else
+            if has_nondigits "${3}" "delete"; then
+              command='delete-param' param='ID' input="${3}"
+            else
+              exit 1
+            fi
+          fi
+          shift
+          ;;
+        "" ) print_delete_help && exit 1 ;;
+        --help | -h ) print_delete_help && exit 0 ;;
+        *) invalid_option "${2}" "delete" ;;
+      esac
+      shift 
+      ;;
+    enable )
+      command='enable'
+      case "${2:-}" in
+        --all | -A ) true ;;
+        --inactive | -i ) quantity='inactive' ;;
+        --subcategory | -s )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "enable"
+          else
+            command='enable-param' input="${3}"
+          fi
+          shift
+          ;;
+        --name | -n )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "enable"
+          else
+            command='enable-param' param='name' input="${3}"
+          fi
+          shift
+          ;;
+        --id )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_number "enable"
+          else
+            if has_nondigits "${3}" "enable"; then
+              command='enable-param' param='ID' input="${3}"
+            else
+              exit 1  
+            fi
+          fi
+          shift
+          ;;
+        "" ) print_enable_help && exit 1 ;;
+        --help | -h ) print_enable_help && exit 0 ;;
+        *) invalid_option "${2}" "enable" ;;  
+      esac
+      shift 
+      ;;
+    disable )
+      command='disable'
+      case "${2:-}" in
+        --all | -A ) true ;;
+        --active | -a ) quantity='active' ;;
+        --subcategory | -s )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "disable"
+          else
+            command='disable-param' input="${3}"
+          fi
+          shift
+          ;;
+        --name | -n )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_string "n" "disable"
+          else
+            command='disable-param' param='name' input="${3}"
+          fi
+          shift
+          ;;
+        --id )
+          if [[ $# -lt 3 || -z "${3}" ]]; then
+            empty_number "disable"
+          else
+            if has_nondigits "${3}" "disable"; then
+              command='disable-param' param='ID' input="${3}"
+            else
+              exit 1
+            fi
+          fi
+          shift
+          ;;        
+        "" ) print_enable_help "disable" && exit 1 ;;
+        --help | -h ) print_enable_help "disable" && exit 0 ;;
+        *) invalid_option "${2}" "disable" ;;  
+      esac
+      shift
+      ;;       
+    --help | -h | help ) print_usage && exit 0 ;;
+    --version | -V | version ) grep '^#/' <"$0" | cut -c4- && exit 0 ;;
+    *) 
+      error "Invalid command '${1}'."
+      echo "Try '${PROGRAM} help' for more information."
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+
+# Check if a Devo 'cloud' value was provided and if it's valid
+if [[ -z "${DEVO_CLOUD}" ]]; then
+  invalid_cloud && exit 1
+else
+  case "${DEVO_CLOUD}" in
+    us | eu | es | saas | ca | sasr ) true ;;  
+    *) invalid_cloud && exit 1 ;;
+  esac
+fi
+
+# Check if a Devo 'token' value was provided
+[[ -z "${DEVO_TOKEN}" ]] && empty_token "token"
+
+declare -r ALERTS_ENDPOINT=https://api-${DEVO_CLOUD}.devo.com/alerts/v1/alertDefinitions
+declare -r PAGE='?page=0&size=1000'
+
+# Confirm if the Alerting API endpoint works
+response=$(curl -sS "${ALERTS_ENDPOINT}" 2>&1 || true)
+[[ "${response}" =~ "curl:" ]] && error "${response}" && exit 1
+ 
+# Retrieve the Devo domain using the token provided
+[[ -z "${DEVO_DOMAIN}" ]] && DEVO_DOMAIN=$(get_domain_from_alerts "${DEVO_TOKEN}")
+
+
+# Get all alerts by default
+arg=$(get_all_alerts)
+
+case "${quantity}" in
+  active )   arg=$(get_active_alerts "true") ;;
+  inactive ) arg=$(get_active_alerts "false") ;;
+  favorite ) arg=$(get_favorite_alerts) ;;
+esac
+
+case "${param}" in
+  subcategory ) args=$(get_alerts_by_subcategory "${input}") ;;
+  name )        args=$(get_alerts_by_name "${input}") ;;
+  ID )          args=$(get_alert_by_id "${input}") ;;
+esac
+
+case "${command}" in
+  get ) 
+    start_msg "Listing" "${quantity}" "${alertType}"
+    case "${alertType}" in
+      definitions )   get_alert_definitions "${arg}" ;;
+      names )         get_alert_names "${arg}" ;;
+      subcategories ) get_subcategory_names "${arg}" ;;
+    esac 
+    ;;
+  get-param )
+    start_msg_param "Listing" "${alertType}" "${param}" "${input}"
+    get_alert_definitions "${args}" "${param}" "${input}"
+    ;;
+  apply ) apply_alert "${file}" ;;
+  copy | delete | enable | disable ) start_msg "Searching" "${quantity}" ;;&
+  copy )    copy_alerts "${arg}" ;;
+  delete )  delete_alerts "${arg}" ;;
+  enable )  enable_alerts "${arg}" ;;
+  disable ) enable_alerts "${arg}" "false" ;;
+  copy-param | delete-param | enable-param | disable-param ) start_msg_param "Searching" "${param}" "${input}" ;;&
+  copy-param )    copy_alerts "${args}" ;;
+  delete-param )  delete_alerts "${args}" ;;
+  enable-param )  enable_alerts "${args}" ;;
+  disable-param ) enable_alerts "${args}" "false" ;;
+esac

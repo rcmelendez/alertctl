@@ -1,0 +1,7 @@
+{
+  "cloud": "us",
+  "token": "MY-MAIN-DEVO-TOKEN",
+  "domain": "my_main_domain",
+  "targetToken": "DEVO-TOKEN-TO-COPY-ALERTS",
+  "targetDomain": "my_target_domain"
+}
