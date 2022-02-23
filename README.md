@@ -51,7 +51,16 @@ alertctl get --all
 </details>
 
 <details>
-<summary>Enable all inactive alerts in your domain:</summary>
+<summary>List alert definitions with the name 'Log4j':</summary>
+<br>
+
+```
+alertctl get --name "Log4j"
+```
+</details>
+
+<details>
+<summary>Enable all inactive alert definitions in your domain:</summary>
 <br>
   
 ```
