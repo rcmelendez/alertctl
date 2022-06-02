@@ -10,7 +10,7 @@ alertctl is a CLI tool written in Bash that manages alert definitions using the 
 
 ## Getting Started
 ### Step 1 - Get a Devo token 
-Follow the steps from the [Devo Alerting API](https://docs.devo.com/confluence/ndt/latest/api-reference/alerting-api) documentation.
+Follow the steps from the [Devo Alerts API](https://docs.devo.com/confluence/ndt/latest/api-reference/alerts-api) documentation.
 
 ### Step 2 - Clone this GitHub repo
 ```
