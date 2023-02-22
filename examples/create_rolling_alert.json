@@ -1,0 +1,15 @@
+{
+  "name": "Inactive Source",
+  "message": "No events from $object",
+  "description": "No events from $object in the last $last_seen_hr hrs",
+  "subcategory": "Monitoring",
+  "alertCorrelationContext": {
+    "querySourceCode": "from siem.logtrust.collector.counter where kind = \"table\", not startswith(object, \"secops\") group by object select sum(events) as events, last(eventdate) as last_seen, (epoch(now()) - epoch(last_seen))/(1000*60*60) as last_seen_hr where last_seen_hr > 24",
+    "priority": 3,
+    "correlationTrigger": {
+      "kind": "rolling",
+      "period": 86400000,
+      "backPeriod": 172800000
+    }
+  }
+}
