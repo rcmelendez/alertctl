@@ -1,0 +1,5 @@
+{
+  "cloud": "us",
+  "token": "SOURCE-DEVO-TOKEN",
+  "targetToken": "TARGET-DEVO-TOKEN-TO-COPY-ALERTS"
+}
