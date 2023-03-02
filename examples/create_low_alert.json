@@ -1,0 +1,15 @@
+{
+  "name": "Okta Ingestion Halted",
+  "message": "No activity in the last hour",
+  "description": "The auth.okta table has no events in the last hour",
+  "subcategory": "Monitoring",
+  "alertCorrelationContext": {
+    "querySourceCode": "from auth.okta",
+    "priority": 5,
+    "correlationTrigger": {
+      "kind": "low",
+      "period": 3600000,
+      "threshold": 0
+    }
+  }
+}
