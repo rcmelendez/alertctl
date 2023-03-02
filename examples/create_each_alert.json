@@ -1,0 +1,13 @@
+{
+  "name": "Heartbeat Alert 5m",
+  "message": "Triggers every 5 minutes",
+  "description": "$total events ingested in the last 5 minutes",
+  "subcategory": "Monitoring",
+  "alertCorrelationContext": {
+    "querySourceCode": "from siem.logtrust.collector.counter where kind = \"technology\" group every 5m select sum(events) as total",
+    "priority": 3,
+    "correlationTrigger": {
+      "kind": "each"
+    }
+  }
+}
