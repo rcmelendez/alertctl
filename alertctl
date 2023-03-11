@@ -1,337 +1,1022 @@
 #!/usr/bin/env bash
 # 
-# alertctl is a CLI tool that manages alert definitions using the Devo Alerting API. 
-# You can create, update, list, delete, enable, and disable alert definitions 
-# in a Devo domain, or copy them over to another domain.
+# alertctl - Work with Devo alerts from the command line.
+# 
+# alertctl is a CLI tool written in Bash that manages alert definitions, triggered alerts,
+# comments, and tags using the Devo Alerts API. 
+# 
+# 
+# BENEFITS
+# 
+# - Create, update, list, delete, enable, and disable alert definitions 
+# - Copy alert definitions over to another domain
+# - List triggered alerts and update their statuses
+# - Add or update comments and tags
 #
 #
-# Required packages:
+# PREREQUISITES
 #
 # - bash v4+
 # - jq
 # - curl
 #
 #
-# USER CONFIGURATION:
+# USER CONFIGURATION
 # 
-# It should be provided in a JSON file. Example config:
+# Configuration can be set either in a JSON file or with environment variables.
 #
+# Example config file:
 # {
 #   "cloud": "us",
-#   "token": "MY-MAIN-DEVO-TOKEN",
-#   "domain": "my_main_domain",
-#   "targetToken": "DEVO-TOKEN-TO-COPY-ALERTS",
-#   "targetDomain": "my_target_domain"
+#   "token": "SOURCE-DEVO-TOKEN",
+#   "targetToken": "TARGET-DEVO-TOKEN-TO-COPY-ALERTS"
 # }  
 #
-# Config search paths sorted by priority:
+# Valid keys:
+# - cloud         -> Devo cloud (e.g. us, eu, ca, sasr, or apac)
+# - token         -> Devo token associated with your domain
+# - targetToken   -> Devo token from the target domain (only required to copy alerts)
 #
-# 1. Path to config file specified by --config or -c option.
-# 2. config.json in the same directory.
-# 3. .devo.json or .config/devo.json in the user home directory. 
-# 4. Embedded config (not recommended).
+# Valid environment variables:
+# - DEVO_CLOUD
+# - DEVO_TOKEN
+# - DEVO_TARGET_TOKEN
 #
-# Required variables:
-# - cloud         -> Devo cloud [us, eu, es, saas, ca, sasr]
-# - token         -> Devo token associated with your Devo domain
-# - targetToken   -> Devo token from the domain where alerts will be copied to (only required to copy alerts)
+# If using a config file, save it as $HOME/.alertctl/config.json.
+# The priority will be as follows (sorted from highest):
 #
-# Optional variables (but recommended):
-# - domain
-# - targetDomain
-#
-# If the domain or targetDomain are not provided, they'll be fetched using their respective tokens. 
-# An unsuccessful attempt will assign a default value of 'unknown'. Both domains are only informational,
-# they don't change the functionality.
+# 1. Config file specified by --config/-c option (e.g. alertctl get --all -c ~/roberto.json)
+# 2. $HOME/.alertctl/config.json
+# 3. Environment variables
 #
 #
-# Devo Alerting API documenation: 
-# https://docs.devo.com/confluence/ndt/latest/api-reference/alerting-api
-#
-#
-#/ Version:  1.0.0
+#/ Version:  1.1.0
 #/ Author:   Roberto Meléndez  [Cambridge, USA]
-#/ GitHub:   https://github.com/rcmelendez/devo-alerting-api
+#/ GitHub:   https://github.com/rcmelendez/alertctl
+#/ API Doc:  https://docs.devo.com/space/latest/95128644
 #/ Contact:  @rcmelendez on LinkedIn, Medium, and GitHub
 #/ Released: Feb 22, 2022
+#/ Updated:  March 11, 2023
 
 
 set -euo pipefail
 
 
-declare -r PROGRAM="${0##*/}"
+OS=$(uname -s)
+RD=$(tput setaf 1)
+GR=$(tput setaf 2)
+YW=$(tput setaf 3)
+MG=$(tput setaf 5)
+CY=$(tput setaf 6)
+RS=$(tput sgr0)
 
-
-declare -r COL_NC='\e[0m'
-declare -r COL_LIGHT_GREEN='\e[0;32m'
-declare -r COL_LIGHT_RED='\e[0;31m'
-declare -r COL_BOLD_GREEN='\e[1;32m'
-declare -r COL_BOLD_RED='\e[1;31m'
-declare -r COL_BOLD_WHITE='\e[1;37m'
-declare -r TICK="[${COL_BOLD_GREEN}✓${COL_NC}]"
-declare -r CROSS="[${COL_BOLD_RED}✗${COL_NC}]"
-declare -r INFO="[i]"
+declare -r APP="${0##*/}"
+declare -r NC='\e[0m'
+declare -r B_GREEN='\e[1;32m'
+declare -r B_RED='\e[1;31m'
+declare -r B_WHITE='\e[1;37m'
+declare -r GY='\e[0;90m'
+declare -r TICK="[${B_GREEN}✓${NC}]"
+declare -r CROSS="[${B_RED}×${NC}]"
+declare -r INFO="[${GY}i${NC}]"
+declare -r APP_CMD=${GR}${APP}${RS}
+declare -r OPTS=${B_WHITE}Options:${NC}
+declare -r EXAMPLE=${B_WHITE}Example:${NC}
+declare -r EXAMPLES=${B_WHITE}Examples:${NC}
+declare -r ID_FG=${MG}--id${RS}
+declare -r ALERT_ID_FG=${MG}--alert-id${RS}
+declare -r TAG_NAME=${MG}--name${RS}
+declare -a idList
 
 
 DEVO_CLOUD="${DEVO_CLOUD-}"
 DEVO_TOKEN="${DEVO_TOKEN-}"
-DEVO_DOMAIN="${DEVO_DOMAIN-}"
 DEVO_TARGET_TOKEN="${DEVO_TARGET_TOKEN-}"
-DEVO_TARGET_DOMAIN="${DEVO_TARGET_DOMAIN-}"
+
+
+# Help functions
+GLOBAL_OPTS=$(cat << END
+${B_WHITE}Global Options:${NC}
+  ${MG}-c${RS}, ${MG}--config${RS} FILENAME      Read configuration from JSON file
+  ${MG}-h${RS}, ${MG}--help${RS}                 Show this menu
+END
+)
+
+
+print_usage() {
+  echo -e "$(
+  cat << HEREDOC
+${APP_CMD} is a CLI tool that manages triggered alerts and alert definitions 
+using the Devo Alerts API. 
+
+  USAGE: ${APP_CMD} [${MG}-c${RS} FILENAME] [command] [options]
+
+${B_WHITE}Commands:${NC}
+  add                       Add a tag or comment to an alert
+  apply                     Create or update an alert definition
+  copy                      Copy alert definitions over to another Devo domain
+  enable                    Enable an alert definition
+  disable                   Disable an alert definition
+  delete                    Delete an alert definition or a comment
+  get                       List triggered alerts or alert definitions
+  update                    Update alert status or comment by its ID
+  status                    Get alert status of a list of triggered alerts
+
+  help                      Show help menu
+  version                   Show current version info
+
+${B_WHITE}Global Options:${NC}
+  ${MG}-c${RS}, ${MG}--config${RS} FILENAME     Read configuration from JSON file
+
+HEREDOC
+)"
+}
+
+
+print_get_help() {
+  echo -e "$(
+  cat << GETCOMMAND
+List triggered alerts or alert definitions.
+
+  USAGE: ${APP_CMD} get [options] 
+
+${OPTS}
+  ${MG}-D${RS}, ${MG}--all-definitions${RS}      List all alert definitions
+      ${MG}--all-names${RS}            List all alert names
+      ${MG}--all-subcategories${RS}    List all subcategories
+  ${MG}-a${RS}, ${MG}--active${RS}               List active alert definitions
+      ${MG}--active-names${RS}         List active alert names
+  ${MG}-I${RS}, ${MG}--inactive${RS}             List inactive alert definitions 
+      ${MG}--inactive-names${RS}       List inactive alert names  
+  ${MG}-F${RS}, ${MG}--favorite${RS}             List favorite alert definitions
+      ${MG}--favorite-names${RS}       List favorite alert names
+  ${MG}-n${RS}, ${MG}--name${RS} ${YW}STRING${RS}          List alert definitions filtered by name  
+  ${MG}-s${RS}, ${MG}--subcategory${RS} ${YW}STRING${RS}   List alert definitions filtered by subcategory
+      ${MG}--id${RS} NUMBER            Get an alert definition by its alert ID
+      ${MG}--no-nulls${RS}             Remove null values (default: false)
+  ${MG}-q${RS}, ${MG}--queries${RS}              List queries from alert definitions
+
+Triggered alerts:
+  ${MG}-A${RS}, ${MG}--all${RS}                  List all triggered alerts
+      ${MG}--limit${RS} NUMBER         Maximum number of triggered alerts that will be listed
+      ${MG}--offset${RS} NUMBER        Position of the 1st element in the list of alerts returned
+      ${MG}--from${RS} NUMBER/STR      List all triggered alerts after this date. Epoch date in millisecs (e.g. 1669852800000)
+                               or a relative date (e.g. 3d, 12h, 15m, etc). Default: 24h
+      ${MG}--order-by${RS} ${YW}STRING${RS}      Order the list of alerts by a specific field (default: id)
+                               Valid fields: id, domain, priority, context, category, srcPort, srcIp, srcHost, dstIp, 
+                                             dstPort, dstHost, protocol, username, application, engine, extraData, 
+                                             status, ack_status_date, createDate, updateDate
+      ${MG}--asc${RS}                  List triggered alerts in ascending order (default: true)
+      ${MG}--desc${RS}                 List triggered alerts in descending order
+      ${MG}--show-all${RS}             Include false positive and closed alerts (default: false)
+      ${MG}--alert-id${RS} NUMBER      Get a triggered alert by its alert ID
+
+      ${MG}--comments${RS}             List comments from triggered alerts      
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# list all alert definitions${NC}
+${APP_CMD} get ${MG}--all-definitions${RS}
+
+${GY}# list alert definitions where the alert name contains 'Critical Error' using a config file${NC}
+${APP_CMD} ${MG}-c${RS} myconfig.json get ${TAG_NAME} ${YW}"Critical Error"${RS}
+
+${GY}# list alert definitions where the subcategory contains 'My_Alerts'${NC}
+${APP_CMD} get ${MG}--subcategory${RS} ${YW}"My_Alerts"${RS}
+
+${GY}# list queries from active alert definitions${NC}
+${APP_CMD} get ${MG}--active --queries${RS}
+
+${GY}# list all triggered alerts (last 24h)${NC}
+${APP_CMD} get ${MG}--all${RS}
+
+${GY}# list all triggered alerts from the last 2 days without showing null values${NC}
+${APP_CMD} get ${MG}--all --from${RS} 2d ${MG}--no-nulls${RS}
+
+${GY}# list only 100 triggered alerts in the last 90 min in descending order using a config file${NC}
+${APP_CMD} get ${MG}--all --from${RS} 90m ${MG}--limit${RS} 100 ${MG}--desc -c${RS} myconfig.json
+
+${GY}# get triggered alert with ID 15523480 without comments${NC}
+${APP_CMD} get ${MG}--alert-id${RS} 15523480 ${MG}--no-comments${RS}
+
+GETCOMMAND
+)"
+}
+
+
+print_add_help() {
+  echo -e "$(
+  cat << ADDCOMMAND
+Add a tag or comment to a triggered alert.
+
+  USAGE: ${APP_CMD} add [options]
+
+${OPTS}
+  ${MG}-i${RS}, ${MG}--alert-id${RS} NUMBER      Alert ID to be added a tag or comment
+      ${MG}--alert-ids${RS} NUMBER     Alert IDs separated by commas to be added a tag or comment
+      ${MG}--comment${RS} ${YW}STRING${RS}       Comment message
+      ${MG}--title${RS} ${YW}STRING${RS}         Comment title
+      ${MG}--type${RS} ${YW}STRING${RS}          Comment type (default: ALERT)      
+      ${MG}--tag${RS} ${YW}STRING${RS}           Tag message
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# add the tag 'Production' to alert with ID 474185${NC}
+${APP_CMD} add ${MG}--tag${RS} ${YW}"Production"${RS} ${MG}--alert-id${RS} 474185
+
+${GY}# add a comment to alert with ID 983320${NC}
+${APP_CMD} add ${MG}--comment${RS} ${YW}"This is a comment"${RS} ${MG}--title${RS} ${YW}"Comment Title"${RS} ${MG}--alert-id${RS} 983320
+
+${GY}# add the same 3 tags to 2 alerts with IDs 160258723 and 160238465${NC}
+${APP_CMD} add ${MG}--tag${RS} ${YW}"linux,auditd,staging"${RS} ${MG}--alert-ids${RS} 160258723,160238465
+
+${GY}# add the same comment to 3 alerts with IDs 160233020, 160233151, and 160233437${NC}
+${APP_CMD} add ${MG}--comment${RS} ${YW}"Comment in bulk for 3 alerts"${RS} ${MG}--alert-ids${RS} 160233020,160233151,160233437 ${MG}--title${RS} ${YW}"Comment in bulk"${RS}
+
+ADDCOMMAND
+)"
+}
+
+
+print_apply_help() {
+  echo -e "$(
+  cat << APPLYCOMMAND
+Create or update an alert definition.
+
+  USAGE: ${APP_CMD} apply ${MG}-f${RS} FILENAME 
+
+${OPTS}
+  ${MG}-f${RS}, ${MG}--file${RS} FILENAME        Create or update an alert definition from JSON file
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# create a new alert definition${NC}
+${APP_CMD} apply ${MG}--file${RS} new_alert.json
+
+${GY}# update an existing alert definition (alert ID required in JSON file)${NC}
+${APP_CMD} apply ${MG}-f${RS} update_alert.json
+
+APPLYCOMMAND
+)"
+}
+
+
+print_copy_help() {
+  echo -e "$(
+  cat << COPYCOMMAND
+Copy alert definitions over to another Devo domain.
+
+  USAGE: ${APP_CMD} copy [options]
+
+${OPTS}
+  ${MG}-A${RS}, ${MG}--all${RS}                  Copy all alert definitions
+  ${MG}-a${RS}, ${MG}--active${RS}               Copy active alert definitions
+  ${MG}-I${RS}, ${MG}--inactive${RS}             Copy inactive alert definitions
+  ${MG}-F${RS}, ${MG}--favorite${RS}             Copy favorite alert definitions
+  ${MG}-n${RS}, ${MG}--name${RS} ${YW}STRING${RS}          Copy alert definitions filtered by name
+  ${MG}-s${RS}, ${MG}--subcategory${RS} ${YW}STRING${RS}   Copy alert definitions filtered by subcategory
+      ${MG}--id${RS} NUMBER            Copy an alert definition by its alert ID
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# copy all alert definitions${NC}
+${APP_CMD} copy ${MG}--all${RS}
+
+${GY}# copy alert definitions where the alert name contains 'Malware Domains'${NC}
+${APP_CMD} ${MG}-c${RS} myconfig.json copy ${TAG_NAME} ${YW}"Malware Domains"${RS}
+
+${GY}# copy alert definitions where the subcategory contains 'Suspicious Activity'${NC}
+${APP_CMD} copy ${MG}--subcategory${RS} ${YW}"Suspicious Activity"${RS}
+
+COPYCOMMAND
+)"
+}
+
+
+print_delete_help() {
+  echo -e "$(
+  cat << DELETECOMMAND
+Delete an alert definition or a comment.
+
+  USAGE: ${APP_CMD} delete [options]
+
+${OPTS}
+  ${MG}-A${RS}, ${MG}--all${RS}                  Delete all alert definitions
+  ${MG}-a${RS}, ${MG}--active${RS}               Delete active alert definitions
+  ${MG}-I${RS}, ${MG}--inactive${RS}             Delete inactive alert definitions
+  ${MG}-F${RS}, ${MG}--favorite${RS}             Delete favorite alert definitions
+  ${MG}-n${RS}, ${MG}--name${RS} ${YW}STRING${RS}          Delete alert definitions filtered by name
+  ${MG}-s${RS}, ${MG}--subcategory${RS} ${YW}STRING${RS}   Delete alert definitions filtered by subcategory
+      ${MG}--id${RS} NUMBER            Delete an alert definition by its alert ID
+      ${MG}--comment-id${RS} NUMBER    Delete a comment by its comment ID
+      ${MG}--comment-ids${RS} NUMBER   Delete comments by their comment IDs
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# delete all alert definitions${NC}
+${APP_CMD} delete ${MG}--all${RS}
+
+${GY}# delete inactive alert definitions${NC}
+${APP_CMD} delete ${MG}--inactive${RS}
+
+${GY}# delete alert definitions with the name 'obsolete'${NC}
+${APP_CMD} ${MG}-c${RS} myconfig.json delete ${TAG_NAME} ${YW}"obsolete"${RS}
+
+${GY}# delete comment with ID 578967${NC}
+${APP_CMD} delete ${MG}--comment-id${RS} 578967
+
+${GY}# delete comments with IDs 578968 and 578969
+${APP_CMD} delete ${MG}--comment-ids${RS} 578968,578969
+
+DELETECOMMAND
+)"
+}
+
+
+# Help menu for enable/disable commands 
+print_enable_help() {
+  local prefix='dis' option='active  ' 
+  local comment=${option::-2}
+  (( $# == 0 )) && prefix='en' option='inactive' comment=${option}
+  echo -e "$(
+  cat << ENABLECOMMAND
+${prefix^}able an alert definition.
+
+  USAGE: ${APP_CMD} ${prefix}able [options]
+
+${OPTS}
+  ${MG}-A${RS}, ${MG}--all${RS}                  ${prefix^}able all alert definitions
+  ${MG}-${option:0:1}${RS}, ${MG}--${option}${RS}             ${prefix^}able ${comment} alert definitions
+  ${MG}-n${RS}, ${MG}--name${RS} ${YW}STRING${RS}          ${prefix^}able alert definitions filtered by name
+  ${MG}-s${RS}, ${MG}--subcategory${RS} ${YW}STRING${RS}   ${prefix^}able alert definitions filtered by subcategory
+      ${MG}--id${RS} NUMBER            ${prefix^}able an alert definition by its alert ID
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# ${prefix}able all alert definitions${NC}
+${APP_CMD} ${prefix}able ${MG}--all${RS}
+
+${GY}# ${prefix}able ${comment} alert definitions${NC}
+${APP_CMD} ${prefix}able ${MG}--${option}${RS}
+
+${GY}# ${prefix}able alert definitions where the subcategory contains 'Testing'${NC}
+${APP_CMD} ${prefix}able ${MG}--subcategory${RS} ${YW}"Testing"${RS}
+
+ENABLECOMMAND
+)"
+}
+
+
+print_status_help() {
+  echo -e "$(
+  cat << STATUSCOMMAND
+Get alert status of a list of triggered alerts.
+
+  USAGE: ${APP_CMD} status [options]
+
+${OPTS}
+      ${MG}--from${RS} NUMBER/STR      List all triggered alerts after this date. Epoch date in millisecs (e.g. 1669852800000)
+                               or a relative date (e.g. 3d, 12h, 15m, etc). Default: 24h
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# list status from all triggered alerts (last 24h)${NC}
+${APP_CMD} status
+
+${GY}# list status from all triggered alerts in the last 15 days${NC}
+${APP_CMD} status ${MG}--from${RS} 15d
+
+${GY}# list status from all triggered alerts since epoch 1669852800000 (2022-12-01 00:00:00 UTC)${NC}
+${APP_CMD} status ${MG}--from${RS} 1669852800000
+
+STATUSCOMMAND
+)"
+}
+
+
+print_update_help() {
+  echo -e "$(
+  cat << UPDATECOMMAND
+Update alert status or comment by its ID.
+
+  USAGE: ${APP_CMD} update [options]
+
+${OPTS}
+  ${MG}-i${RS}, ${MG}--alert-id${RS} NUMBER      Alert ID to update     
+  ${MG}-s${RS}, ${MG}--status${RS} NUMBER        New status code of the alert. Valid codes include: 
+                               0   = Unread
+                               1   = Updated
+                               2   = False Positive
+                               100 = Watched
+                               300 = Closed
+                               500 = Reminder
+                               600 = Recovery
+                               700 = Anti-flood
+  ${MG}-A${RS}, ${MG}--all${RS}                  Update status of all triggered alerts
+      ${MG}--unread${RS}               Update status of unread alerts
+      ${MG}--updated${RS}              Update status of updated alerts
+      ${MG}--false-positive${RS}       Update status of false positive alerts
+      ${MG}--watched${RS}              Update status of watched alerts
+      ${MG}--closed${RS}               Update status of closed alerts
+      ${MG}--reminder${RS}             Update status of reminder alerts
+      ${MG}--recovery${RS}             Update status of recovery alerts
+      ${MG}--anti-flood${RS}           Update status of anti-flood alerts
+      ${MG}--from${RS} NUMBER          List all triggered alerts after this date. Epoch date in millisecs (e.g. 1669852800000) 
+                               or a relative date (e.g. 3d, 12h, 15m, etc). Default: 24h
+
+      ${MG}--comment-id${RS} NUMBER    Comment ID to update
+      ${MG}--comment-ids${RS} NUMBER   Comment IDs to update 
+      ${MG}--comment${RS} ${YW}STRING${RS}       Comment message
+      ${MG}--title${RS} ${YW}STRING${RS}         Comment title
+      ${MG}--type${RS} ${YW}STRING${RS}          Comment type (default: ALERT)                                  
+
+${GLOBAL_OPTS}
+
+${EXAMPLES}
+${GY}# update alert with ID 137861977 to status 100 (watched)${NC}
+${APP_CMD} update ${MG}--alert-id${RS} 137861977 ${MG}--status${RS} 100
+
+${GY}# update all triggered alerts from the last 6h to status 300 (closed)${NC}
+${APP_CMD} update ${MG}--all --status${RS} 300 ${MG}--from${RS} 6h
+
+${GY}# update closed alerts to status 0 (unread) from the last 15 days${NC}
+${APP_CMD} update ${MG}--closed --status${RS} 0 ${MG}--from${RS} 15d
+
+${GY}# update comment with ID 578969
+${APP_CMD} update ${MG}--comment${RS} ${YW}"Updated message"${RS} ${MG}--comment-id${RS} 578969 ${MG}--title${RS} ${YW}"New Title"${RS}
+
+UPDATECOMMAND
+)"
+}  
+
+
+(( $# == 0 )) && print_usage && exit 1
 
 
 error() {
-  echo -e "${CROSS}" "ERROR:" "${1}" >&2
+  echo -e "${CROSS} Error: ${1}" >&2
 }
  
 
-# Check if jq is installed
+# Requirements
+# jq
 if [[ -z "$(command -v jq)" ]]; then 
-  error "Unable to find 'jq'. Please install it with your package manager:"
-  echo -e "Ubuntu: sudo apt install jq\nCentOS: sudo [yum|dnf] install jq\nmacOS:  brew install jq" && exit 1
+  error "unable to find 'jq'. You can install it by typing:"
+  [[ "${OS}" == "Linux" ]] && echo -e "Ubuntu: ${GR}sudo apt${RS} install jq\nCentOS: ${GR}sudo dnf${RS} install jq" && exit 1
+  [[ "${OS}" == "Darwin" ]] && echo -e "${GR}brew${RS} install jq" && exit 1
+else
+  JQ=$(jq --version)
+fi
+
+# bash v4 or higher
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf '%b' "${CROSS} Error: outdated Bash version. At least Bash 4.0 is required." >&2 && exit 1
 fi
 
 
-# Bash v4 or higher
-if (( BASH_VERSINFO[0] < 4 )); then 
-  error "Outdated Bash version. At least Bash 4.0 is required." && exit 1
-fi
+[[ "${OS}" == "Linux" ]] && NOW=$(date +%s%3N)
+[[ "${OS}" == "Darwin" ]] && NOW=$(date +%s000)
+
+
+# Default values
+FROM=$(( NOW - 86400000 ))  # last 24h
+LIMIT=1000
+OFFSET=0
+SHOW_ALL=false
+ORDER_BY='id'
+ORDER_ASC=true
+ANNOTATIONS=true
+TAGS=true
+COMMENT_TYPE='ALERT'
+NULLS=true
+CFG_FLAG=false
 
 
 # Auxiliary functions
 get_length() {
-  echo "${1}" | jq '. | length'
+  jq 'length' <<< "${1}"
 }
 
 
 has_length() {
   local length
   length=$(get_length "${1}")
-  if (( length == 0 )); then 
-    results_msg "${length}" && return 1
+  if (( length == 0 )); then
+    if [[ "${2-}" == "triggered" ]]; then
+      results_msg_triggered "${length}" & return 1
+    else  
+      results_msg "${length}" && return 1
+    fi  
   fi  
 }
 
 
 valid_file() {
   if [[ ! -e "${1}" ]]; then
-    error "File '${1}' does not exist." 
+    error "file '${1}' does not exist." 
   elif [[ ! -s "${1}" ]]; then 
-    error "File '${1}' cannot be empty." 
+    error "file '${1}' cannot be empty." 
   else 
     return 0  
   fi
-  return 1  
+  exit 1  
 }
 
 
 valid_json() {
-  if jq empty "${1}" 2>/dev/null; then
-    return 0
-  else
-    error "Invalid JSON format. Please check the JSON syntax and try again." && exit 1
-  fi  
+  jq empty "${1}" 2>/dev/null && return 0 || error "invalid JSON object. Please fix the syntax and try again." && exit 1
+}
+
+
+valid_alert() {
+  [[ $(jq -e 'has("name")' "${1}") == false ]] &>/dev/null && missing_key "name"
+  [[ $(jq -e 'has("subcategory")' "${1}") == false ]] &>/dev/null && missing_key "subcategory"
+  [[ $(jq -e '.alertCorrelationContext | has("querySourceCode")' "${1}") == false ]] &>/dev/null && missing_key "querySourceCode"
+  [[ $(jq -e '.alertCorrelationContext | has("priority")' "${1}") == false ]] &>/dev/null && missing_key "priority"
+  [[ $(jq -e '.alertCorrelationContext | has("correlationTrigger")' "${1}") == false ]] &>/dev/null && missing_key "correlationTrigger"
+  return 0
 }
 
 
 read_keys() {
-  jq -e 'has("cloud")' "${1}" >/dev/null 2>&1 && DEVO_CLOUD=$(jq -r '.cloud' "${1}")
-  jq -e 'has("token")' "${1}" >/dev/null 2>&1 && DEVO_TOKEN=$(jq -r '.token' "${1}")
-  jq -e 'has("domain")' "${1}" >/dev/null 2>&1 && DEVO_DOMAIN=$(jq -r '.domain' "${1}")
-  jq -e 'has("targetToken")' "${1}" >/dev/null 2>&1 && DEVO_TARGET_TOKEN=$(jq -r '.targetToken' "${1}")
-  jq -e 'has("targetDomain")' "${1}" >/dev/null 2>&1 && DEVO_TARGET_DOMAIN=$(jq -r '.targetDomain' "${1}")
+  if jq -e 'has("cloud")' "${1}" &>/dev/null; then 
+    DEVO_CLOUD=$(jq -r '.cloud' "${1}")
+  else
+    missing_key "cloud"
+  fi
+  if jq -e 'has("token")' "${1}" &>/dev/null; then
+    DEVO_TOKEN=$(jq -r '.token' "${1}")
+  else
+    missing_key "token"
+  fi
+  jq -e 'has("targetToken")' "${1}" &>/dev/null && DEVO_TARGET_TOKEN=$(jq -r '.targetToken' "${1}")
+}
+
+
+read_config() {
+  if valid_file "${1}"; then
+    valid_json "${1}" && read_keys "${1}"
+  fi
 }
 
 
 read_config_from_dir() {
-  local file='devo.json'
-  if [[ -e "${HOME}/.config/${file}" ]]; then
-    jq empty "${HOME}/.config/${file}" 2>/dev/null && read_keys "${HOME}/.config/${file}"
-  fi
-  if [[ -e "${HOME}/.${file}" ]]; then
-    jq empty "${HOME}/.${file}" 2>/dev/null && read_keys "${HOME}/.${file}"
-  fi
-  # config.json takes precedence
-  if [[ -e "${PWD}/config.json" ]]; then
-    jq empty "${PWD}/config.json" 2>/dev/null && read_keys "${PWD}/config.json"
+  if [[ -e "${HOME}/.alertctl/config.json" ]]; then
+    jq empty "${HOME}/.alertctl/config.json" &>/dev/null && read_keys "${HOME}/.alertctl/config.json"
   fi
 }
 
 
-can_get_domain() {
-    # The Query API will throw a permissions error if the token is not authorized to
-    # access the table devo.internal.collector.consumptions to retrieve the Devo domain.
-  if echo "${1}" | jq -e 'has("error")' >/dev/null 2>&1; then 
-    # Assign 'unknown' by default
-    echo "unknown" && return 1
-  fi
+epoch_to_date() {
+  [[ "${OS}" == "Linux" ]] && date -d @$(("${1}" / 1000)) -u '+%Y-%m-%d %H:%M:%S UTC'
+  [[ "${OS}" == "Darwin" ]] && date -r $(("${1}" / 1000)) -u '+%Y-%m-%d %H:%M:%S UTC'
 }
 
 
-get_domain_from_token() {
-  local query post
-  query='{"query": "from devo.internal.collector.consumptions group by domain", "from": "3d","to": "now", "mode": {"type": "json/simple"}}'
-  post=$(curl -sS --connect-timeout 10 \
-                 -X POST "https://apiv2-${DEVO_CLOUD}.devo.com/search/query" \
-                 -H "Authorization: Bearer ${1}" \
-                 -H "Content-Type: application/json" \
-                 -d ''"${query}"'' 2>&1)
-  # Confirm if the Query API endpoint works
-  if [[ "${post}" =~ "curl:" ]]; then
-    error "${post}" && exit 1
-  elif can_get_domain "${post}"; then 
-    echo "${post}" | jq -r '.domain'
-  fi
+relative_date_to_epoch() {
+  local in="${1}" digit date epoch=0 
+  first=${in:0:1} digit=${in//[^0-9]/}
+  [[ ${first} != ?(-)+([0-9]) ]] && invalid_relative_date "${in}"
+  (( digit < 1 )) && zero_relative_date "${in}"
+  date=$(tr -d '0-9' <<< "${1}")
+  [[ "${#date}" -gt 1 ]] && letter_relative_date "${in}"
+  case "${date}" in
+    s) epoch=$(( 1 * 1000 * digit )) ;;
+    m) epoch=$(( 60 * 1000 * digit )) ;;
+    h) epoch=$(( 60 * 60 * 1000 * digit ));;
+    d) epoch=$(( 60 * 60 * 24 * 1000 * digit )) ;;
+    M) epoch=$(( 60 * 60 * 24 * 30 * 1000 * digit )) ;;
+    Y) epoch=$(( 60 * 60 * 24 * 365 * 1000 * digit )) ;;
+    *) letter_relative_date "${date}" ;;
+  esac
+  FROM=$(( NOW - epoch ))
 }
 
 
-# 1st attempt to retrieve the Devo domain
-get_domain_from_alerts() {
-  local allAlerts myAlerts
-  allAlerts=$(curl -sS --connect-timeout 10 \
-                   -X GET "${ALERTS_ENDPOINT}${PAGE}" \
-                   -H "standAloneToken: ${1}" \
-                   -H "Content-Type: application/json")
-  if [[ $(get_length "${allAlerts}") -gt 0 ]]; then
-    myAlerts=$(echo "${allAlerts}" | jq 'map(select(.subcategory | startswith("lib.my.")))')
-    if [[ -n "${myAlerts}" && "${myAlerts}" != "[]" ]]; then
-      echo "${myAlerts}" | jq '.[0].alertCorrelationContext.nameId' | awk -F . '{print $3}'
-    else 
-      get_domain_from_token "${1}"
-    fi
-  else 
-    # 2nd attempt
-    get_domain_from_token "${1}"
+valid_from() {
+  if [[ ${1} == ?(-)+([0-9]) ]]; then
+    FROM="${1}"
+  else
+    relative_date_to_epoch "${1}"
   fi  
 }
 
 
-has_target_domain() {
-  if [[ -z "${DEVO_TARGET_DOMAIN}" ]]; then
-    if [[ -z "${DEVO_TARGET_TOKEN}" ]]; then
-      empty_token "targetToken"
+count_comment_keys() {
+  jq 'map(.comments[].id) | length' <<< "${1}"
+}
+
+
+no_error() {
+  local errMsg errCode
+  [[ -z "${1}" || "${1}" == '[]' ]] && return 0
+  if jq &>/dev/null <<< "${1}"; then
+    if jq -e 'has("error")' &>/dev/null <<< "${1}"; then
+      errMsg=$(jq -r '.error.message' <<< "${1}")
+      errCode=$(jq '.error.code' <<< "${1}")
+    elif jq -e 'has("errorCode")' &>/dev/null <<< "${1}"; then
+      errMsg=$(jq -r '.message' <<< "${1}")
+      errCode=$(jq '.errorCode' <<< "${1}")
+    elif jq -e 'has("msg")' &>/dev/null <<< "${1}"; then
+      errMsg=$(jq -r '.msg' <<< "${1}")
+      errCode=$(jq '.code' <<< "${1}")
     else
-      DEVO_TARGET_DOMAIN=$(get_domain_from_alerts "${DEVO_TARGET_TOKEN}")
+      return 0  
     fi
+  else
+    error "$(head -n 1 <<< "${1}")" && return 1
+  fi  
+  error "${errCode}: ${errMsg}" && return 1
+}
+
+
+no_nulls() {
+  if [[ "${JQ:3}" == "1.6" ]]; then
+    jq 'del(..|nulls)' <<< "${1}"
+  else
+    jq 'del(recurse(.[]?;true)|select(. == null))' <<< "${1}"
   fi
+}
+
+
+alert_exists() {
+  local errCode
+  IFS=, read -ra ids <<< "${1}"
+  for i in "${ids[@]}"; do
+    errCode=$(get_triggered_alert_by_id "${i}" | jq '.error.code')
+    [[ "${errCode}" != 400 ]] && idList+=("${i}")
+  done
+  [[ -z ${idList[*]+"${idList[*]}"} ]] && results_msg_triggered "0" && return 1 || return 0
+}
+
+
+comment_exists() {
+  local list commentIds ok
+  FROM=$(( NOW - 60 * 60 * 24 * 30 * 1000 * 3 ))  # look back 3 months
+  list=$(get_triggered_alerts_ids "comment")
+  commentIds=$(get_all_comments "${list}" | jq 'map(.comments[].id)')
+  IFS=, read -ra ids <<< "${1}"
+  for i in "${ids[@]}"; do 
+    ok=$(jq '.[] | select(. == '"${i}"')' <<< "${commentIds}")
+    [[ -n "${ok}" ]] && idList+=("${ok}")
+  done
+  [[ -z ${idList[*]+"${idList[*]}"} ]] && results_msg_no_comments && return 1 || return 0
 }
 
 
 # Info messages functions
 start_msg() {
+  local from
+  from=$(epoch_to_date "${FROM}")
   if [[ "${1}" == "Listing" ]]; then
-    echo -e "${INFO} ${1} ${2} alert ${3} in domain '${DEVO_DOMAIN}'..."
+    if [[ "${3}" == "triggered" ]]; then
+      echo -e "${INFO} ${1} ${2} ${3} alerts since ${CY}${from}${RS}"
+    else  
+      echo -e "${INFO} ${1} ${2} alert ${3}"
+    fi  
   else 
-    echo -e "${INFO} ${1} ${2} alert definitions in domain '${DEVO_DOMAIN}'..."
+    echo -e "${INFO} ${1} ${2} alert definitions"
   fi
+}
+
+
+start_msg_status() {
+  local from
+  from=$(epoch_to_date "${FROM}")
+  echo -e "${INFO} ${1} status from all ${2} alerts since ${CY}${from}${RS}"
+}
+
+
+start_msg_update_id() {
+  echo -e "${INFO} Updating alert with ID ${CY}${1}${RS} to status ${CY}${2}${RS}"
+}
+
+
+start_msg_update() {
+  echo -e "${INFO} Updating ${1} alerts to status ${CY}${2}${RS}"
 }
 
 
 start_msg_param() {
   if [[ "${1}" == "Listing" ]]; then
-    echo -e "${INFO} ${1} alert ${2} with ${3} '${4}' in domain '${DEVO_DOMAIN}'..."
+    if [[ "${2}" == "triggered" ]]; then
+      echo -e "${INFO} ${1} ${2} alert with ${3} ${CY}${4}${RS}"
+    else  
+      echo -e "${INFO} ${1} alert ${2} with ${3} ${CY}${4}${RS}"
+    fi  
   else 
-    echo -e "${INFO} ${1} alert definitions with ${2} '${3}' in domain '${DEVO_DOMAIN}'..."
+    echo -e "${INFO} ${1} alert definitions with ${2} ${CY}${3}${RS}"
   fi  
+}
+
+
+start_msg_add() {
+  if [[ $# -gt 3 ]]; then  
+    if [[ "${3}" == 1 ]]; then
+      echo -e "${INFO} ${2^}ing ${1} to alert with ID ${CY}${4}${RS}"
+    else 
+      echo -e "${INFO} ${2^}ing ${1} to ${3} alerts"
+    fi
+  else
+    [[ "${3}" == 1 ]] && echo -e "${INFO} ${2^}ing ${1}" || echo -e "${INFO} ${2^}ing ${3} ${1}s"
+  fi
 }
 
 
 results_msg() {
-  if [[ "${1}" -eq 0 ]]; then
-    echo -e "${CROSS} No alert definitions found in domain '${DEVO_DOMAIN}'."
-  else  
-    echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} alert ${2} found in domain '${DEVO_DOMAIN}'.${COL_NC}"
-  fi  
+  [[ "${1}" -eq 0 ]] && echo -e "${CROSS} No alert definitions found." || echo -e "\n${TICK} ${GR}${1} alert ${2} found.${RS}"
 }
 
 
-results_msg_param() {
-  local msg='definition'
+results_msg_triggered() {
+  local msg='alert'
   if [[ "${1}" -eq 0 ]]; then
-    echo -e "${CROSS} No alert definitions with ${2} '${3}' found in domain '${DEVO_DOMAIN}'."
+    echo -e "${CROSS} No triggered alerts found."
   else
-    [[ "${1}" -gt 1 ]] && msg='definitions' 
-    echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} alert ${msg} with ${2} '${3}' found in domain '${DEVO_DOMAIN}'.${COL_NC}"
-  fi
+    [[ "${1}" -gt 1 ]] && msg='alerts'
+    echo -e "\n${TICK} ${GR}${1} triggered ${msg} found.${RS}"
+  fi  
 }
 
 
 results_msg_search() {
   local msg='definition'
   [[ "${1}" -gt 1 ]] && msg='definitions'
-  echo -e "${TICK} ${1} alert ${msg} found in domain '${DEVO_DOMAIN}':"
+  if [[ $# -gt 1 ]]; then 
+    echo -e "${INFO} ${CY}${1}${RS} alert ${msg} found:"
+  else
+    echo -e "${TICK} ${GR}${1} alert ${msg} found:${RS}"
+  fi
 }
 
 
 results_msg_subcategories() {
-  echo -e "\n${TICK} ${COL_LIGHT_GREEN}${1} subcategor${2} found in domain '${DEVO_DOMAIN}'.${COL_NC}"
+  echo -e "\n${TICK} ${GR}${1} subcategor${2} found.${RS}"
+}
+
+
+results_msg_add() {
+  local type=${1} msg='alerts'
+  if [[ $# -gt 2 ]]; then
+    if [[ "${1}" == "tag" ]]; then
+      [[ "${3}" -eq 1 ]] && msg='alert'
+      echo -e "${TICK} ${GR}${1^} successfully ${2}ed to ${3} ${msg}.${RS}"
+    else
+      [[ "${3}" -gt 1 ]] && type='comments'
+      echo -e "${TICK} ${GR}${3} ${type} successfully ${2}ed.${RS}"
+    fi  
+  else
+    echo -e "${TICK} ${GR}${1^} successfully ${2}ed.${RS}"
+  fi
+}
+
+
+results_msg_no_comments() {
+  echo -e "${CROSS} No comments found."
 }
 
 
 # Error functions
 invalid_param() {
-  error "${1} not provided. To filter alerts by this parameter, please enter a valid String (case insensitive)."  
+  error "${1} not provided. Strings are case insensitive."  
+}
+
+
+more_info_msg() {
+  echo -e "Try '${APP_CMD} ${1} ${MG}--help${RS}' for more information." && exit 1
 }
 
 
 invalid_option() {
-  error "Invalid option '${1}'."
-  echo "Try '${PROGRAM} ${2} --help' for more information."
+  local type='option'
+  [[ $# -gt 2 ]] && type='command'
+  error "invalid ${type} '${1}'."
+  [[ "${2}" == "global" ]] && msg="${APP_CMD} help"
+  more_info_msg "${2}"
+}
+
+
+example_relative_date() {
+  echo -e "\n${EXAMPLES}\n${GY}# get data from the last 5 days${RS}\n${MG}--from${RS} 5d" 
+  echo -e "\n${GY}# get data from the last 24 hours${RS}\n${MG}--from${RS} 24h" && exit 1
+}
+
+
+invalid_relative_date() {
+  error "invalid relative date '${1}'. It must start with a number." && example_relative_date
+}
+
+
+zero_relative_date() {
+  error "invalid relative date '${1}'. Number must be larger than 0." && example_relative_date
+}
+
+
+letter_relative_date() {
+  error "invalid relative date '${1}'. Use one of the following: \ns: seconds\nm: minutes\nh: hours\nd: days\nM: months\nY: years" && example_relative_date
+}
+
+
+example_tag() {
+  echo -e "\n${EXAMPLE}\n${GY}# add tag to alert with ID 1261725${RS}\n${APP_CMD} add ${MG}--tag${RS} ${YW}\"My Tag\"${RS} ${ALERT_ID_FG} 1261725" && exit 1
+}
+
+
+example_comment() {
+  if [[ "${1}" == "delete" || "${1}" == "update" ]]; then
+    echo -e "\n${EXAMPLE}\n${GY}# ${1} comment with ID 417055${RS}\n${APP_CMD} ${1} ${MG}--comment-id${RS} 417055"
+  else
+    echo -e "\n${EXAMPLE}\n${GY}# ${1} comment to alert with ID 159924089${RS}\n${APP_CMD} ${1} ${MG}--comment${RS} ${YW}\"My comment\"${RS} ${ALERT_ID_FG} 159924089 ${MG}--title${RS} ${YW}\"My Title\"${RS}"
+  fi
   exit 1
 }
 
 
 empty_string() {
   case "${1}" in
-    s )
-      invalid_param "Subcategory"
-      echo -e "\nExample:\n${PROGRAM} ${2} --subcategory \"Network Monitoring\""
-      exit 1
+    s)
+      invalid_param "subcategory"
+      echo -e "\n${EXAMPLE}\n${APP_CMD} ${2} ${MG}--subcategory${RS} ${YW}\"Network Monitoring\"${RS}" && exit 1
       ;;
-    n )
-      invalid_param "Alert name"
-      echo -e "\nExample:\n${PROGRAM} ${2} --name \"Invalid User\""
-      exit 1
+    n)
+      invalid_param "alert name"
+      echo -e "\n${EXAMPLE}\n${APP_CMD} ${2} ${TAG_NAME} ${YW}\"Invalid User\"${RS}" && exit 1
       ;;
-    f ) 
-      error "File name not provided. To create/update an alert, please enter a file name that contains the alert definition."
-      echo -e "\nExample:\n${PROGRAM} ${2} --file new_alert.json"
-      exit 1
+    f) 
+      error "file name not provided. To create/update an alert, enter a file name that contains the alert definition."
+      echo -e "\n${EXAMPLE}\n${APP_CMD} ${2} ${MG}--file${RS} new_alert.json" && exit 1
       ;;
+    t) error "tag not provided. Please enter the tag to be added." && example_tag ;;
   esac
 }
 
 
+empty_comment() {
+  error "comment ${1} not provided. Please enter a ${1} to be added." && example_comment "${2}"
+}
+
+
+empty_commentId() {
+  error "comment ID not provided. Please enter a valid number." && example_comment "${1}"
+}
+
+
+ids_msg() {
+  error "${1} IDs not provided. Please enter numeric IDs separated by commas (without spaces)."
+}
+
+
+empty_commentIds() {
+  ids_msg "comment"
+  echo -e "\n${EXAMPLE}\n${GY}# ${1} comments with IDs 417059, 417060, and 417061${NC}\n${APP_CMD} ${1} ${MG}--comment-ids${RS} 417059,417060,417061" && exit 1
+}
+
+
 empty_number() {
-  error "Alert ID not provided. Please enter a valid number."
-  echo -e "\nExample:\n${PROGRAM} ${1} --id 169820"
+  error "alert ID not provided. Please enter a valid number."
+  [[ "${1}" == "add-tag" ]] && example_tag
+  [[ "${1}" == "add-comment" ]] && example_comment "add"  
+  echo -e "\n${EXAMPLE}\n${APP_CMD} ${1} ${ID_FG} 169820" && exit 1
+}
+
+
+empty_ids() {
+  if [[ "${1}" == "comment" ]]; then
+    ids_msg "alert" && echo -e "\n${EXAMPLE}\n${GY}# add the same comment to 2 alerts with IDs 133410247 and 137861977${RS}"
+    echo -e "${APP_CMD} add ${MG}--comment${RS} ${YW}\"My Comment\"${RS} ${MG}--alert-ids${RS} 133410247,137861977 ${MG}--title${RS} ${YW}\"My Title\"${RS}"
+  elif [[ "${1}" == "tag" ]]; then 
+    ids_msg "alert" && echo -e "\n${EXAMPLE}\n${GY}# add the same 3 tags to 2 alerts with IDs 160258723 and 160238465${RS}"
+    echo -e "${APP_CMD} add ${MG}--tag${RS} ${YW}\"linux,auditd,staging\"${RS} ${MG}--alert-ids${RS} 160258723,160238465"
+  fi
   exit 1
 }
 
 
-has_nondigits() {
-  if [[ "${1}" =~ [^[:digit:]] ]]; then
-    error "Invalid alert ID '${1}'. Alert IDs can only have numbers."
-    echo -e "\nExample:\n${PROGRAM} ${2} --id 169820"
-    return 1
-  fi
+empty_status() {
+  error "status code not provided. Please enter a valid alert status:" && status_list "update"
+}
+
+
+invalid_status() {
+  error "invalid status code '${1}'. Please enter a valid alert status:" && status_list "update"
+}
+
+
+missing_option() {
+  error "${MG}--${1}${RS} option is required.\n\n${EXAMPLE}"
+  case "${2}" in
+    update)        echo -e "${GY}# update comment with ID 417055${NC}\n${APP_CMD} update ${MG}--comment${RS} ${YW}\"My New Comment\"${RS} ${MG}--comment-id${RS} 417055 ${MG}--title${RS} ${YW}\"My Title\"${RS}" ;;
+    update-status) echo -e "${GY}# close alert with ID 1552348${NC}\n${APP_CMD} update ${ALERT_ID_FG} 1552348 ${MG}--status${RS} 300" ;;
+    add-tag)       echo -e "${GY}# add tag to alert with ID 810687${NC}\n${APP_CMD} add ${MG}--tag${RS} ${YW}\"My Tag\"${RS} ${MG}--alert-id${RS} 810687" ;;
+    add-comment)   echo -e "${GY}# add comment to alert with ID 810687${NC}\n${APP_CMD} add ${MG}--comment${RS} ${YW}\"My Comment\"${RS} ${MG}--alert-id${RS} 810687 ${MG}--title${RS} ${YW}\"My Title\"${RS}" ;;
+  esac
+  exit 1
+}
+
+
+missing_key() {
+  local msg='JSON'
+  case "${1}" in
+    cloud|token|targetToken) msg='config' ;;
+  esac
+  error "'${1}' key not found. Please include the key and its value in the ${msg} file." && exit 1
+}
+
+
+missing_file() {
+  error "config file required when using ${MG}--config${RS}." && exit 1
+}
+
+
+status_list() {
+  echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\nReminder\t= 500\nRecovery\t= 600\nAnti-Flood\t= 700
+\n${EXAMPLE}\n${GY}# close alert with ID 851964${NC}\n${APP_CMD} ${1} ${ALERT_ID_FG} 851964 ${MG}--status${RS} 300" && exit 1
+}
+
+
+empty_limit() {
+  error "limit not provided. Please enter a valid number (default: ${LIMIT})."
+  echo -e "\n${EXAMPLE}\n${APP_CMD} get ${MG}--all --limit${RS} 500" && exit 1
+}
+
+
+empty_offset() {
+  error "offset not provided. Please enter a valid number (default: ${OFFSET})." 
+  echo -e "\n${EXAMPLE}\n${APP_CMD} get ${MG}--all --offset${RS} 10" && exit 1
+}
+
+
+empty_epoch() {
+  local msg="now (${NOW})"
+  [[ "${1}" == "from" ]] && msg="last 24h (${FROM})"
+  error "date not provided. Please enter an epoch in millisecs [default: ${msg}] or a relative date."
+  echo -e "\n${EXAMPLES}\n${GY}# get alert status since epoch 1659355200000 (2022-08-01 12:00 UTC)${NC}\n${APP_CMD} status ${MG}--from${RS} 1659355200000" 
+  echo -e "\n${GY}# list triggered alerts from the last 6 hours${NC}\n${APP_CMD} get ${MG}--all --from${RS} 6h" && exit 1
+}
+
+
+empty_order_by() {
+  error "order-by value not provided. Please enter one of the following (default: ${ORDER_BY}):" 
+  echo -e "- id\n- domain\n- priority\n- context\n- srcPort\n- srcIp\n- srcHost\n- dstIp\n- dstPort\n- dstHost
+- username\n- extraData\n- status\n- ack_status_date\n- createDate\n- updateDate"
+  echo -e "\n${EXAMPLE}\n${APP_CMD} get ${MG}--all-alerts --order-by${RS} context" 
+  echo -e "\n${GY}# for descending order use --desc${NC}\n${APP_CMD} get ${MG}--all-alerts --order-by${RS} status ${MG}--desc${RS}" && exit 1
 }
 
 
 empty_token() {
-  error "No token was found. Please set a valid Devo '${1}' value in your JSON config file." && exit 1
-} 
+  error "token not found. Please set a valid Devo '${1}' in your config file." && exit 1
+}
+
+
+has_nondigits() {
+  local msg=${ID_FG} cmd=${2}
+  if [[ "${1}" =~ [^[:digit:]] ]]; then
+    error "invalid ID '${1}'. IDs can only have numbers."
+    [[ "${cmd}" == "add" ]] && example_tag
+    [[ "${cmd}" =~ "comment" ]] && example_comment "${2:0:-8}"
+    [[ "${cmd}" =~ "id" ]] && msg=${ALERT_ID_FG} cmd=${2:0:-3}
+    echo -e "\n${EXAMPLE}\n${APP_CMD} ${cmd} ${msg} 169820" && return 1
+  fi
+}
+
+
+has_nondigits_triggered() {
+  if [[ "${1}" =~ [^[:digit:]] ]]; then
+    error "invalid value '${1}'. Numbers are only supported." && return 1
+  fi
+}
 
 
 invalid_cloud() {
-  error "Invalid Devo environment. Please set a valid 'cloud' value in your JSON config file: [us, eu, es, saas, ca, sasr]." && exit 1
+  error "invalid Devo cloud. Please use one of the supported clouds: us, eu, ca, sasr, or apac." && exit 1
+}
+
+
+abort() {
+  error "Operation aborted." && exit 1
 }
 
 
 # Core functions
 get_all_alerts() {
   curl -sS --connect-timeout 10 \
-       -X GET "${ALERTS_ENDPOINT}${PAGE}" \
+       -X GET "${ALERT_DEFINITIONS_URL}${PAGE}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"    
+}
+
+
+get_all_triggered_alerts() {
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_URL}/list?limit=${LIMIT}&offset=${OFFSET}&from=${FROM}&to=${NOW}&showAll=${SHOW_ALL}&orderby=${ORDER_BY}&orderasc=${ORDER_ASC}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
        -H "Content-Type: application/json"    
 }
@@ -348,11 +1033,11 @@ get_favorite_alerts() {
 
 
 get_alerts_by_name() {
-  local nameFilter
+  local name
   # Encode the name to URL-encoded format in case of non-alphanumeric characters
-  nameFilter=$(printf %s "${1}" | jq -sRr @uri) 
+  name=$(printf %s "${1}" | jq -sRr @uri) 
   curl -sS --connect-timeout 10 \
-       -X GET "${ALERTS_ENDPOINT}?nameFilter=${nameFilter}" \
+       -X GET "${ALERT_DEFINITIONS_URL}?nameFilter=${name}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
        -H "Content-Type: application/json"
 }
@@ -366,16 +1051,67 @@ get_alerts_by_subcategory() {
 
 get_alert_by_id() {
   curl -sS --connect-timeout 10 \
-       -X GET "${ALERTS_ENDPOINT}?idFilter=${1}" \
+       -X GET "${ALERT_DEFINITIONS_URL}?idFilter=${1}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
        -H "Content-Type: application/json"  
 }
 
 
-# Config function
-read_config() {
-  if valid_file "${1}" && valid_json "${1}"; then
-    read_keys "${1}"
+get_triggered_alert_by_id() {
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_URL}/get?id=${1}&annotations=${ANNOTATIONS}&tags=${TAGS}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"
+}
+
+
+get_all_triggered_alerts_status() {
+  curl -sS --connect-timeout 10 \
+       -X GET "${ALERTS_URL}/listStatus?from=${FROM}" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json"
+}
+
+
+get_all_comments() {
+  curl -sS --connect-timeout 10 \
+       -X POST "${COMMENTS_URL}/list" \
+       -H "standAloneToken: ${DEVO_TOKEN}" \
+       -H "Content-Type: application/json" \
+       -d "${1}"
+}
+
+
+update_alert_status() {
+  local stdout err status
+  stdout=$(curl -sS --connect-timeout 10 \
+                -X PUT "${ALERTS_URL}/updateStatus?id=${1}&status=${2}" \
+                -H "standAloneToken: ${DEVO_TOKEN}" \
+                -H "Content-Type: application/json")
+  if jq -e 'has("error")' &>/dev/null <<< "${stdout}"; then
+    err=$(jq -r '.error.message' <<< "${stdout}") && error "${err,}." && exit 1
+  else
+    status=$(jq '.status' <<< "${stdout}")
+    (( status == ${2} )) && echo -e "${TICK} ${GR}Alert successfully updated.${RS}" 
+  fi
+}
+
+
+update_alert_status_list() {
+  local stdout list msg='alert'
+  list=$(get_length "${2}")
+  if (( list > 0 )); then
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X PUT "${ALERTS_URL}/updateStatusList?status=${1}" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d "${2}")
+    if [[ $(get_length "${stdout}") == 0 ]]; then
+      (( list > 1 )) && msg='alerts'
+      echo -e "${TICK} ${GR}${list} ${msg} successfully updated.${RS}"
+    fi
+  else
+    [[ "${3}" == "all" ]] && echo -e "${CROSS} No alerts found." || echo -e "${CROSS} No ${3} alerts found."
   fi
 }
 
@@ -385,13 +1121,86 @@ get_alert_definitions() {
   local msg='definition' length
   length=$(get_length "${1}")
   if has_length "${1}"; then  
-    echo "${1}" | jq '.'
-    if (( $# < 2 )); then
-      (( length > 1 )) && msg='definitions'
-      results_msg "${length}" "${msg}"
+    echo
+    if [[ "${NULLS}" = true ]]; then
+      jq <<< "${1}"
     else
-      results_msg_param "${length}" "${2}" "${3}"
+      no_nulls "${1}"
+    fi  
+    (( length > 1 )) && msg='definitions'
+    results_msg "${length}" "${msg}" 
+  fi
+}
+
+
+get_triggered_alerts() {
+  local length
+  length=$(get_length "${1}")
+  if has_length "${1}" "triggered"; then
+    echo 
+    if [[ "${NULLS}" = true ]]; then
+      jq <<< "${1}"
+    else
+      no_nulls "${1}"
     fi
+    results_msg_triggered "${length}"
+  fi
+}
+
+
+get_triggered_alert() {
+  if jq -e 'has("error")' &>/dev/null <<< "${1}"; then
+    results_msg_triggered "0"
+  else
+    echo && jq <<< "${1}" && results_msg_triggered "1"
+  fi
+}
+
+
+get_triggered_alerts_status() {
+  local length
+  length=$(get_length "${1}")
+  if has_length "${1}" "triggered"; then
+    echo && jq <<< "${1}" && results_msg_triggered "${length}" && echo && get_alerts_status_summary "${1}"
+  fi
+}
+
+
+get_alerts_status_summary() {
+  local results cnt total=0 tab='\t'
+  results=$(jq 'to_entries | group_by(.value) | map(.[0]+{count:length})' <<< "${1}")
+  for i in 2 500 600 700; do
+    cnt=$(jq '.[] | select(.value=='"${i}"').count' <<< "${results}")
+    total=$(( total + cnt ))
+  done
+  (( total > 0 )) && tab='\t\t'
+  echo -e "STATUS${tab}CODE\tALERTS"
+  for status in 0 1 2 100 300 500 600 700; do
+    cnt=$(jq '.[] | select(.value=='"${status}"').count' <<< "${results}")
+    if [[ -n "${cnt}" ]]; then
+      case "${status}" in
+        0)   echo -e "Unread${tab}${status}\t${cnt}" ;;
+        1)   echo -e "Updated${tab}${status}\t${cnt}" ;;
+        2)   echo -e "False-positive\t${status}\t${cnt}" ;;
+        100) echo -e "Watched${tab}${status}\t${cnt}" ;;
+        300) echo -e "Closed${tab}${status}\t${cnt}" ;; 
+        500) echo -e "Reminder\t${status}\t${cnt}" ;;
+        600) echo -e "Recovery\t${status}\t${cnt}" ;;
+        700) echo -e "Anti-flood\t${status}\t${cnt}" ;;
+      esac
+    fi
+  done
+}
+
+
+get_triggered_alerts_ids() {
+  SHOW_ALL=true
+  if [[ $# -lt 1 ]]; then
+    get_all_triggered_alerts | jq 'map(.id)'
+  elif [[ "${1}" == "comment" ]]; then
+    get_all_triggered_alerts | jq 'map(.id | tostring)'
+  else  
+    get_all_triggered_alerts | jq 'map(select(.status=='"${1}"').id)'
   fi
 }
 
@@ -400,672 +1209,771 @@ get_alert_names() {
   local msg='name' length
   length=$(get_length "${1}")
   if has_length "${1}"; then  
-    echo "${1}" | jq -r '.[] | .name'
-    (( length > 1 )) && msg='names'
+    echo && jq -r '.[] | .name' <<< "${1}"
+    (( length > 1 )) && msg='names' 
+    results_msg "${length}" "${msg}"  
+  fi
+}
+
+
+get_alert_queries() {
+  local msg='query' length
+  length=$(get_length "${1}")
+  if has_length "${1}"; then  
+    echo && jq -r '.[] | .alertCorrelationContext.querySourceCode' <<< "${1}"
+    (( length > 1 )) && msg='queries' 
     results_msg "${length}" "${msg}"  
   fi
 }
 
 
 get_subcategory_names() {
-  local subcategory suffix='y'
+  local subcat suffix='y'
   if has_length "${1}"; then  
-    subcategory=$(echo "${1}" | jq -r 'unique_by(.subcategory) | .[].subcategory' | awk -F . '{print $4}' | tee /dev/tty)
-    subcategory=$(echo "${subcategory}" | wc -l | xargs)
-    (( subcategory > 1 )) && suffix='ies'   
-    results_msg_subcategories "${subcategory}" "${suffix}"  
+    echo
+    subcat=$(jq -r 'unique_by(.subcategory) | .[].subcategory' <<< "${1}" | awk -F . '{print $4}' | tee /dev/tty)
+    subcat=$(wc -l <<< "${subcat}" | xargs)
+    (( subcat > 1 )) && suffix='ies' && results_msg_subcategories "${subcat}" "${suffix}"  
   fi
 }
 
 
-# Create/update function
+get_comments() {
+  local stdout from list alertMsg='alert' commentMsg='comment' length count
+  from=$(epoch_to_date "${FROM}")
+  echo -e "${INFO} Listing alert comments since ${CY}${from}${RS}"
+  list=$(get_length "${1}")
+  if (( list > 0 )); then
+    stdout=$(get_all_comments "${1}")
+    length=$(get_length "${stdout}")
+    if no_error "${stdout}"; then
+      if [[ "${length}" == 0 ]]; then
+        (( list > 1 )) && alertMsg='alerts'
+        echo -e "${CROSS} No comments found in ${list} triggered ${alertMsg}."
+      else
+        echo && jq <<< "${stdout}"
+        count=$(count_comment_keys "${stdout}")
+        (( count > 1 )) && commentMsg='comments' && (( length > 1 )) && alertMsg='alerts'
+        echo -e "\n${TICK} ${GR}${count} ${commentMsg} found in ${length} triggered ${alertMsg}.${RS}"
+      fi
+    fi  
+  else
+    results_msg_triggered "${list}"
+  fi
+}
+
+
+# Apply function
 apply_alert() {
-  local method='POST' msg='creat' stdout
-  if valid_file "${1}" && valid_json "${1}"; then
-    if jq -e 'has("id")' "${1}" >/dev/null 2>&1; then
-      method='PUT' msg='updat'
-    fi
-    echo -e "${INFO} ${msg^}ing alert definition..."
+  local method='POST' msg='creat' stdout alertName
+  if valid_file "${1}" && valid_json "${1}" && valid_alert "${1}"; then
+    jq -e 'has("id")' "${1}" &>/dev/null && method='PUT' msg='updat'
+    alertName=$(jq -r '.name' "${1}")
+    echo -e "${INFO} ${msg^}ing alert definition ${CY}${alertName}${RS}"
     stdout=$(curl -sS --connect-timeout 10 \
-                  -X "${method}" "${ALERTS_ENDPOINT}" \
+                  -X "${method}" "${ALERT_DEFINITIONS_URL}" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
                   -H "Content-Type: application/json" \
-                  -d @"${1}" | tee /dev/tty)
-    if echo "${stdout}" | jq -e 'has("error")' >/dev/null 2>&1; then
-       echo -e "\n\n${CROSS} ${COL_LIGHT_RED}Failed to ${msg}e alert definition.${COL_NC}" 
-    else  
-      echo -e "\n\n${TICK} ${COL_LIGHT_GREEN}Alert definition successfully ${msg}ed.${COL_NC}"
+                  -d @"${1}")
+    no_error "${stdout}" && echo -e "${TICK} ${GR}Alert definition successfully ${msg}ed.${RS}"
+  fi
+}
+
+
+# Update function
+update_comments() {
+  local stdout commentIds
+  IFS=, read -ra ids <<< "${1}"
+  start_msg_add "comment" "updat" "${#ids[@]}"
+  if comment_exists "${1}"; then
+    commentIds=$(IFS=,; echo "${idList[*]}")
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X PUT "${COMMENTS_URL}/bulk/update" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d '{"idMap":{"":['"${commentIds}"']},"commentMsg":"'"${2}"'","commentTitle":"'"${3}"'","commentType":"'"${4}"'"}')
+    if no_error "${stdout}"; then
+      if [[ "${#idList[@]}" == 1 ]]; then
+        results_msg_add "comment" "updat"
+      else
+        results_msg_add "comment" "updat" "${#idList[@]}"
+      fi
     fi
   fi  
 }
 
 
+# Add functions
+add_tag() {
+  local stdout
+  IFS=, read -ra ids <<< "${1}"
+  start_msg_add "tag" "add" "${#ids[@]}" "${1}"
+  if alert_exists "${1}"; then
+    printf -v alertIds '"%s",' "${idList[@]}"
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X PUT "${TAGS_URL}" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d '{"alertIds":['"${alertIds%,}"'],"tags":["'"${2}"'"]}')
+    if no_error "${stdout}"; then
+      if [[ "${#ids[@]}" != "${#idList[@]}" ]]; then
+        results_msg_add "tag" "add" "${#idList[@]}"
+      else
+        results_msg_add "tag" "add"
+      fi
+    fi
+  fi
+}
+
+
+add_comments() {
+  local stdout alertIds
+  IFS=, read -ra ids <<< "${1}"
+  start_msg_add "comment" "add" "${#ids[@]}" "${1}"
+  if alert_exists "${1}"; then
+    alertIds=$(IFS=,; echo "${idList[*]}")
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X POST "${COMMENTS_URL}/bulk/add" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d '{"elementIds":['"${alertIds}"'],"commentMsg":"'"${2}"'","commentTitle":"'"${3}"'","commentType":"'"${4}"'"}')
+    if no_error "${stdout}"; then
+      if [[ "${#idList[@]}" == 1 ]]; then
+        results_msg_add "comment" "add"
+      else
+        results_msg_add "comment" "add" "${#idList[@]}"
+      fi
+    fi
+  fi
+}
+
+
 # Copy functions
 post_alerts() { 
-  local length count=1 payload alertName stdout err=0
+  local length payload alertName stdout count=1 err=0 errMsg errCode
   length=$(get_length "${1}")
   # base64 encode each JSON object
-  for row in $(echo "${1}" | jq -r '.[] | @base64'); do
+  for row in $(jq -r '.[] | @base64' <<< "${1}"); do
     _jq() {
-      echo "${row}" | base64 -d | jq -r "${1}"
+      base64 -d <<< "${row}" | jq -r "${1}"
     }
     payload=$(_jq '.')
     alertName=$(_jq '.name')
-    echo -e "${INFO} Creating alert definition '${COL_BOLD_WHITE}${alertName}${COL_NC}'... [${count}/${length}]"
+    echo && echo -e "${INFO} Creating alert definition ${CY}${alertName}${RS} ... [${count}/${length}]"
     stdout=$(curl -sS --connect-timeout 10 \
-                  -X POST "${ALERTS_ENDPOINT}" \
+                  -X POST "${ALERT_DEFINITIONS_URL}" \
                   -H "standAloneToken: ${DEVO_TARGET_TOKEN}" \
                   -H "Content-Type: application/json" \
-                  -d ''"${payload}"'' | tee /dev/tty)
-    if echo "${stdout}" | jq -e 'has("error")' >/dev/null 2>&1; then 
+                  -d ''"${payload}"'')
+    if jq -e 'has("error")' &>/dev/null <<< "${stdout}"; then
       (( err++ )) || true
-    fi  
-    echo -e "\n"
+      errMsg=$(jq -r '.error.message' <<< "${stdout}")
+      errCode=$(jq '.error.code' <<< "${stdout}")
+      error "${errCode}: ${errMsg}"
+    else 
+      echo -e "${TICK} ${GR}Alert successfully created.${RS}"
+    fi
     (( count++ )) || true
   done
-  echo -e  "${INFO} Alerts processed:  ${length}"
-  echo -e  "${TICK} ${COL_LIGHT_GREEN}Alerts created:    $(( length - err ))${COL_NC}"
-  echo -e "${CROSS} ${COL_LIGHT_RED}Alerts failed:     ${err}${COL_NC}" 
+  echo -e "\n${INFO} Alerts processed:\t${length}"
+  echo -e "${TICK} ${GR}Alerts created:\t$(( length - err ))${RS}"
+  echo -e "${CROSS} ${RD}Alerts failed:\t${err}${RS}" 
 }
 
 
 clean() {
-  local alertDefinitions
+  local alertList
   # Delete all non-required keys
-  alertDefinitions=$(echo "${1}" | jq 'map(select(.subcategory | contains("lib.my.")) | 
-                                       del(.id,.creationDate,.categoryId,.subcategoryId,.isActive,.isFavorite,
-                                       .isAlertChain,.alertCorrelationContext.id,.alertCorrelationContext.nameId,
-                                       .alertCorrelationContext.ownerEmail,.actionPolicyId[]))')
-  # Remove 'lib.my.<domain>' from subcategory
-  # shellcheck disable=SC2001
-  echo "${alertDefinitions}" | sed -e 's/"subcategory": "lib.my.'"${DEVO_DOMAIN}"'./"subcategory": "/g'
+  alertList=$(jq 'map(select(.subcategory | contains("lib.my.")) | del(.id,.creationDate,.categoryId,.subcategoryId,.isActive,.isFavorite,
+                  .isAlertChain,.alertCorrelationContext.id,.alertCorrelationContext.nameId,.alertCorrelationContext.ownerEmail,.actionPolicyId[]))' <<< "${1}")
+  sed -E 's/"subcategory": "lib\.my\.[^\.]*\.([^"]+)"/"subcategory": "\1"/g' <<< "${alertList}"
 }
 
 
 copy_alerts() {
   local length msg='definition' answer
   length=$(get_length "${1}")
-  # Check if a Devo 'targetToken' value was provided
-  has_target_domain     
+  [[ -z "${DEVO_TARGET_TOKEN}" ]] && empty_token "targetToken"     
   if has_length "${1}"; then
-    results_msg_search "${length}"
-    echo "${1}" | jq -r '.[] | .name' && echo
+    results_msg_search "${length}" "copy"
+    echo && jq -r '.[] | .name' <<< "${1}" && echo
     (( length > 1 )) && msg='definitions'
-    read -rp "${INFO} Do you want to COPY the alert ${msg} over to domain '${DEVO_TARGET_DOMAIN}'? [y/N]: " answer
+    read -rp "[i] Do you want to COPY the alert ${msg}? [y/N]: " answer
     case "${answer:0:1}" in
-      y | Y )
-        post_alerts "$(clean "${1}")"
-        ;;
-      *) error "Operation aborted." && exit 1 ;;
+      y|Y) post_alerts "$(clean "${1}")" ;;
+      *)   abort ;;
     esac
   fi
 }
 
 
-# Delete function
+# Delete functions
 delete_alerts() {
   local length alertIds msg='definition' answer
   length=$(get_length "${1}")
   if has_length "${1}"; then
-    for id in $(echo "${1}" | jq -r '.[] | @base64'); do
+    for id in $(jq -r '.[] | @base64' <<< "${1}"); do
       _jq() {
-        echo "${id}" | base64 -d | jq -r "${1}"
+        base64 -d  <<< "${id}" | jq -r "${1}"
       }
       alertIds+="alertIds=$(_jq '.id')&"
     done
     alertIds="${alertIds::-1}"
-    results_msg_search "${length}"
-    echo "${1}" | jq -r '.[] | .name' && echo
+    results_msg_search "${length}" "delete"
+    echo && jq -r '.[] | .name' <<< "${1}" && echo
     (( length > 1 )) && msg='definitions'
-    read -rp "${INFO} Do you want to DELETE ${length} alert ${msg}? [y/N]: " answer
+    read -rp "[i] Do you want to ${RD}DELETE${RS} the alert ${msg}? [y/N]: " answer
     case "${answer:0:1}" in
-      y | Y )
-        echo -e "${TICK} Deleting alert ${msg}..."
-        curl -sS --connect-timeout 10 \
-             -X DELETE "${ALERTS_ENDPOINT}?${alertIds}" \
-             -H "standAloneToken: ${DEVO_TOKEN}" \
-             -H "Content-Type: application/json"
-        echo -e "${TICK} ${COL_LIGHT_GREEN}${length} alert ${msg} successfully deleted.${COL_NC}"
+      y|Y)
+        stdout=$(curl -sS --connect-timeout 10 \
+                      -X DELETE "${ALERT_DEFINITIONS_URL}?${alertIds}" \
+                      -H "standAloneToken: ${DEVO_TOKEN}" \
+                      -H "Content-Type: application/json")
+        if no_error "${stdout}"; then 
+          echo -e "${TICK} ${GR}Alert ${msg} successfully deleted.${RS}"
+        fi  
         ;;
-      *) error "Operation aborted." && exit 1 ;;
+      *) abort ;;
     esac
+  fi
+}
+
+
+delete_comments() {
+  local stdout commentIds
+  IFS=, read -ra ids <<< "${1}"
+  start_msg_add "comment" "delet" "${#ids[@]}"
+  if comment_exists "${1}"; then
+    commentIds=$(IFS=,; echo "${idList[*]}")
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X DELETE "${COMMENTS_URL}/delete" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d "[${commentIds}]")
+    if no_error "${stdout}"; then
+      if [[ "${#idList[@]}" == 1 ]]; then
+        results_msg_add "comment" "delet"
+      else
+        results_msg_add "comment" "delet" "${#idList[@]}"
+      fi
+    fi
   fi
 }
 
 
 # Enable/disable function
 enable_alerts() {
-  local bool=false prefix='dis' length alertIds msg='definition' answer
+  local bool=false prefix='dis' length alertIds msg='definition' stdout
   (( $# < 2 )) && bool=true prefix='en'
   length=$(get_length "${1}")
   if has_length "${1}"; then
-    for id in $(echo "${1}" | jq -r '.[] | @base64'); do
+    for id in $(jq -r '.[] | @base64' <<< "${1}"); do
       _jq() {
-        echo "${id}" | base64 -d | jq -r "${1}"
+        base64 -d <<< "${id}" | jq -r "${1}"
       }
       alertIds+="alertIds=$(_jq '.id')&"
     done
     alertIds="${alertIds}enable=${bool}"
-    results_msg_search "${length}"
-    echo "${1}" | jq -r '.[] | .name' && echo
-    (( length > 1 )) && msg='definitions'
-    read -rp "${INFO} Do you want to ${prefix^^}ABLE ${length} alert ${msg}? [y/N]: " answer
-    case "${answer:0:1}" in
-      y | Y )
-        echo -e "${TICK} ${prefix^}abling alert ${msg}..."
-        curl -sS --connect-timeout 10 \
-             -X PUT "${ALERTS_ENDPOINT}/status?${alertIds}" \
-             -H "standAloneToken: ${DEVO_TOKEN}" \
-             -H "Content-Type: application/json"
-        echo -e "${TICK} ${COL_LIGHT_GREEN}${length} alert ${msg} successfully ${prefix}abled.${COL_NC}"
-        ;;
-      *) error "Operation aborted." && exit 1 ;;
-    esac
+    results_msg_search "${length}" "enable"
+    echo && jq -r '.[] | .name' <<< "${1}" && echo
+    (( length > 1 )) && msg='definitions' 
+    stdout=$(curl -sS --connect-timeout 10 \
+                  -X PUT "${ALERT_DEFINITIONS_URL}/status?${alertIds}" \
+                  -H "standAloneToken: ${DEVO_TOKEN}" \
+                  -H "Content-Type: application/json")
+    no_error "${stdout}" && echo -e "${TICK} ${GR}Alert ${msg} successfully ${prefix}abled.${RS}"
   fi    
 }
 
 
-# Help functions
-print_usage() {
-  cat << HEREDOC
-${PROGRAM} is a tool that manages alert definitions using the Devo Alerting API. 
-
-  USAGE: ${PROGRAM} [-c FILENAME] [COMMAND] [options]
-
-Commands:
-  get                       Get all or a subset of alert definitions
-  apply                     Create or update an alert definition
-  copy                      Copy all or a subset of alert definitions over to another Devo domain
-  delete                    Delete all or a subset of alert definitions
-  enable                    Enable all or a subset of alert definitions
-  disable                   Disable all or a subset of alert definitions
-
-Options:
-  -A, --all                 All alert definitions
-      --all-names           All alert names
-      --all-subcategories   All subcategories
-  -a, --active              Active alert definitions
-      --active-names        Active alert names
-  -i, --inactive            Inactive alert definitions
-      --inactive-names      Inactive alert names
-  -F, --favorite            Favorite alert definitions
-      --favorite-names      Favorite alert names
-  -f, --file FILENAME       Read an alert definition from JSON file
-  -n, --name STRING         Alert definitions filtered by name
-  -s, --subcategory STRING  Alert definitions filtered by subcategory
-      --id NUMBER           Alert definition filtered by its alert ID
-  -c, --config FILENAME     Read configuration from JSON file
-
-Other commands:
-  help                      Show help menu
-  version                   Show current version info
-
-HEREDOC
-}
-
-
-print_get_help() {
-  cat << GETCOMMAND
-Get all or a subset of alert definitions in a Devo domain.
-
-  USAGE: ${PROGRAM} [-c FILENAME] get [options] 
-
-Options:
-  -A, --all                 Get all alert definitions
-      --all-names           Get all alert names
-      --all-subcategories   Get all subcategories
-  -a, --active              Get active alert definitions
-      --active-names        Get active alert names
-  -i, --inactive            Get inactive alert definitions 
-      --inactive-names      Get inactive alert names  
-  -F, --favorite            Get favorite alert definitions
-      --favorite-names      Get favorite alert names
-  -n, --name STRING         Get alert definitions filtered by name  
-  -s, --subcategory STRING  Get alert definitions filtered by subcategory
-      --id NUMBER           Get an alert definition by its alert ID
-  -c, --config FILENAME     Read configuration from JSON file      
-  -h, --help                Show this menu
-
-Examples:
-# List all alert definitions
-${PROGRAM} get --all
-
-# Fetch only alert definitions where the alert name contains 'Critical Error'
-${PROGRAM} -c config.json get --name "Critical Error"
-
-# Get alert definitions where the subcategory contains 'My Alerts'
-${PROGRAM} get --subcategory "My Alerts"
-
-GETCOMMAND
-}
-
-
-print_apply_help() {
-  cat << APPLYCOMMAND
-Create or update an alert definition in a Devo domain.
-
-  USAGE: ${PROGRAM} [-c FILENAME] apply -f FILENAME 
-
-Options:
-  -f, --file FILENAME     Create/update an alert definition from JSON file
-  -c, --config FILENAME   Read configuration from JSON file
-  -h, --help              Show this menu
-
-Examples:
-# Create a new alert definition
-${PROGRAM} apply --file new_alert.json
-
-# Update an existing alert definition (alert ID required in JSON file)
-${PROGRAM} apply -f update_alert.json
-
-APPLYCOMMAND
-}
-
-
-print_copy_help() {
-  cat << COPYCOMMAND
-Copy all or a subset of alert definitions from one Devo domain to another.
-
-  USAGE: ${PROGRAM} [-c FILENAME] copy [options]
-
-Options:
-  -A, --all                 Copy all alert definitions
-  -a, --active              Copy active alert definitions
-  -i, --inactive            Copy inactive alert definitions
-  -F, --favorite            Copy favorite alert definitions
-  -n, --name STRING         Copy alert definitions filtered by name
-  -s, --subcategory STRING  Copy alert definitions filtered by subcategory
-      --id NUMBER           Copy an alert definition by its alert ID
-  -c, --config FILENAME     Read configuration from JSON file
-  -h, --help                Show this menu
-
-Examples:
-# Copy all alert definitions
-${PROGRAM} copy --all
-
-# Copy alert definitions where the alert name contains 'Malware Domains'
-${PROGRAM} -c config.json copy --name "Malware Domains"
-
-# Copy alert definitions where the subcategory contains 'Suspicious Activity'
-${PROGRAM} copy --subcategory "Suspicious Activity"
-
-COPYCOMMAND
-}
-
-
-print_delete_help() {
-  cat << DELETECOMMAND
-Delete all or a subset of alert definitions in a Devo domain.
-
-  USAGE: ${PROGRAM} [-c FILENAME] delete [options]
-
-Options:
-  -A, --all                 Delete all alert definitions
-  -a, --active              Delete active alert definitions
-  -i, --inactive            Delete inactive alert definitions
-  -F, --favorite            Delete favorite alert definitions
-  -n, --name STRING         Delete alert definitions filtered by name
-  -s, --subcategory STRING  Delete alert definitions filtered by subcategory
-      --id NUMBER           Delete an alert definition by its alert ID
-  -c, --config FILENAME     Read configuration from JSON file      
-  -h, --help                Show this menu
-
-Examples:
-# Delete all alert definitions
-${PROGRAM} delete --all
-
-# Delete inactive alerts
-${PROGRAM} delete --inactive
-
-# Delete alert definitions with "obsolete" in their names
-${PROGRAM} -c config.json delete --name "obsolete"
-
-DELETECOMMAND
-}
-
-
-# Help menu for enable/disable commands 
-print_enable_help() {
-  local prefix='dis' option='active  ' 
-  local comment=${option::-2}
-  (( $# == 0 )) && prefix='en' option='inactive' comment=${option}
-  cat << ENABLECOMMAND
-${prefix^}able all or a subset of alert definitions in a Devo domain.
-
-  USAGE: ${PROGRAM} [-c FILENAME] ${prefix}able [options] 
-
-Options:
-  -A, --all                 ${prefix^}able all alert definitions
-  -${option:0:1}, --${option}            ${prefix^}able ${comment} alert definitions
-  -n, --name STRING         ${prefix^}able alert definitions filtered by name  
-  -s, --subcategory STRING  ${prefix^}able alert definitions filtered by subcategory
-      --id NUMBER           ${prefix^}able an alert definition by its alert ID
-  -c, --config FILENAME     Read configuration from JSON file      
-  -h, --help                Show this menu
-
-Examples:
-# ${prefix^}able all alert definitions
-${PROGRAM} ${prefix}able --all
-
-# ${prefix^}able ${comment} alerts
-${PROGRAM} ${prefix}able --${option}
-
-ENABLECOMMAND
-}
-
-
-(( $# == 0 )) && print_usage && exit 1
-
-
 # Defaults
 command='get'
-quantity='all'
 alertType='definitions'
-param='subcategory'
+type='comment'
+quantity='' 
+param=''
 input=''
-
-
-read_config_from_dir
+alertId=''
+commentId=''
+comment=''
+title=''
+status=''
+statusCode=''
 
 
 while (( $# > 0 )); do
   case "${1}" in
-    --config | -c ) read_config "${2}" && shift ;;
-    get )
+    --config|-c) CFG_FLAG=true CFG_FILE="${2}" && shift ;;
+    get)
       case "${2:-}" in
-        --all | -A ) true ;;
-        --all-names )         alertType='names' ;;
-        --all-subcategories ) alertType='subcategories' ;;
-        --active | -a )       quantity='active' ;;
-        --active-names )      quantity='active' alertType='names' ;;
-        --inactive | -i )     quantity='inactive' ;;
-        --inactive-names )    quantity='inactive' alertType='names' ;;  
-        --favorite | -F )     quantity='favorite' ;;
-        --favorite-names )    quantity='favorite' alertType='names' ;;
-        --subcategory | -s )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "s" "get"
-          else  
-            command='get-param' input="${3}"
-          fi
-          shift
+        --all|--all-alerts|-A) 
+          alertType='triggered' quantity='all'
+          while (( $# > 2 )); do
+            case "${3:-}" in
+              --config|-c) [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              --limit) 
+                if [[ $# -lt 4 || -z "${4}" ]]; then
+                  empty_limit
+                else
+                  has_nondigits_triggered "${4}" && LIMIT="${4}" || exit 1  
+                fi
+                shift
+                ;;
+              --offset)
+                if [[ $# -lt 4 || -z "${4}" ]]; then
+                  empty_offset
+                else
+                  has_nondigits_triggered "${4}" && OFFSET="${4}" || exit 1
+                fi
+                shift
+                ;;
+              --from) [[ $# -lt 4 || -z "${4}" ]] && empty_epoch "from" || valid_from "${4}" && shift ;;
+              --order-by)
+                if [[ $# -lt 4 || -z "${4}" ]]; then
+                  empty_order_by
+                else  
+                  case "${4}" in
+                    id)              true ;;
+                    domain)          ORDER_BY='domain' ;;
+                    priority)        ORDER_BY='priority' ;;
+                    context)         ORDER_BY='context' ;;
+                    srcPort)         ORDER_BY='srcPort' ;;
+                    srcIp)           ORDER_BY='srcIp' ;;
+                    srcHost)         ORDER_BY='srcHost' ;;
+                    dstIp)           ORDER_BY='dstIp' ;;
+                    dstPort)         ORDER_BY='dstPort' ;;
+                    dstHost)         ORDER_BY='dstHost' ;;
+                    username)        ORDER_BY='username' ;;
+                    extraData)       ORDER_BY='extraData' ;;
+                    status)          ORDER_BY='status' ;;
+                    ack_status_date) ORDER_BY='ack_status_date' ;;
+                    createDate)      ORDER_BY='createDate' ;;
+                    updateDate)      ORDER_BY='updateDate' ;;
+                    *)               invalid_option "${4}" "get" ;;
+                  esac
+                fi
+                shift
+                ;;
+              --asc)      ORDER_ASC=true ;;  
+              --desc)     ORDER_ASC=false ;;   
+              --show-all) SHOW_ALL=true ;;
+              --no-nulls) NULLS=false ;;
+              *)          invalid_option "${3}" "get" ;; 
+            esac
+            shift
+          done
           ;;
-        --name | -n )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "get"
-          else
-            command='get-param' param='name' input="${3}"
-          fi
-          shift 
-          ;;
-        --id )
+        --alert-id)
           if [[ $# -lt 3 || -z "${3}" ]]; then
             empty_number "get"
           else
-            if has_nondigits "${3}" "get"; then
-              command='get-param' alertType='definition' param='ID' input="${3}"
-            else 
-              exit 1  
-            fi  
+            has_nondigits "${3}" "get-id" && command='get-param' alertType='triggered' param='alertID' input="${3}" || exit 1 
           fi
+          while (( $# > 3 )); do
+            case "${4:-}" in
+              --no-annotations|--no-comments) ANNOTATIONS=false ;;
+              --no-tags)                      TAGS=false ;;
+              --config|-c)                    [[ $# -lt 5 || -z "${5}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${5}" && shift ;;
+              *)                              invalid_option "${4}" "get" ;; 
+            esac
+            shift
+          done
           shift
           ;;  
-        "" ) print_get_help && exit 1 ;;
-        --help | -h ) print_get_help && exit 0 ;;
-        *) invalid_option "${2}" "get" ;;   
+        --all-definitions|--all-def|-D) 
+          quantity='all'
+          while (( $# > 2 )); do
+            case "${3}" in
+              --no-nulls)   NULLS=false ;;
+              --queries|-q) alertType='queries' ;;
+              --config|-c)  [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              *)            invalid_option "${3}" "get" ;;
+            esac
+            shift
+          done
+          ;;
+        --all-names)         quantity='all' alertType='names' ;;
+        --all-subcategories) quantity='all' alertType='subcategories' ;;
+        --active|-a)
+          quantity='active'
+          while (( $# > 2 )); do
+            case "${3}" in
+              --no-nulls)   NULLS=false ;;
+              --queries|-q) alertType='queries' ;;
+              --config|-c)  [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              *)            invalid_option "${3}" "get" ;;
+            esac
+            shift
+          done
+          ;;
+        --active-names)     quantity='active' alertType='names' ;;
+        --inactive|-I)
+          quantity='inactive'
+          while (( $# > 2 )); do
+            case "${3}" in
+              --no-nulls)   NULLS=false ;;
+              --queries|-q) alertType='queries' ;;
+              --config|-c)  [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              *)            invalid_option "${3}" "get" ;;
+            esac
+            shift
+          done
+          ;;
+        --inactive-names)   quantity='inactive' alertType='names' ;;  
+        --favorite|-F)
+          quantity='favorite'
+          while (( $# > 2 )); do
+            case "${3}" in
+              --no-nulls)   NULLS=false ;;
+              --queries|-q) alertType='queries' ;;
+              --config|-c)  [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              *)            invalid_option "${3}" "get" ;;
+            esac
+            shift
+          done          
+          ;;
+        --favorite-names) quantity='favorite' alertType='names' ;;
+        --subcategory|-s) [[ $# -lt 3 || -z "${3}" ]] && empty_string "s" "get" || command='get-param' param='subcategory' input="${3}" && shift ;;
+        --name|-n)        [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "get" || command='get-param' param='name' input="${3}" && shift ;;
+        --id)             [[ $# -lt 3 || -z "${3}" ]] && empty_number "get" || has_nondigits "${3}" "get" && command='get-param' alertType='definition' param='ID' input="${3}" || exit 1 && shift ;;
+        --comments|--annotations) 
+          command='get-param' alertType='comments'
+          while (( $# > 2 )); do
+            case "${3:-}" in
+              --from)      [[ $# -lt 4 || -z "${4}" ]] && empty_epoch "from" || valid_from "${4}" && shift ;;
+              --config|-c) [[ $# -lt 4 || -z "${4}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+              *)           invalid_option "${3}" "get" ;;
+            esac
+          shift
+          done
+          ;;
+        "")        print_get_help && exit 1 ;;
+        --help|-h) print_get_help && exit 0 ;;
+        *)         invalid_option "${2}" "get" ;;
       esac
       shift
       ;;
-    apply )
+    status)
+      command='status' alertType='triggered'
+      while (( $# > 1 )); do
+        case "${2:-}" in
+          --from)      [[ $# -lt 3 || -z "${3}" ]] && empty_epoch "from" || valid_from "${3}" && shift ;;
+          --config|-c) [[ $# -lt 3 || -z "${3}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${3}" && shift ;;
+          --help|-h)   print_status_help && exit 0 ;;
+          *)           invalid_option "${2}" "status" ;;
+        esac
+      shift  
+      done
+      ;;
+    update)
+      command='update'
+      (( $# == 1 )) && print_update_help && exit 1
+      while (( $# > 1 )); do
+        case "${2:-}" in
+          --comment|--annotation)
+            command='update-comment'
+            [[ $# -lt 3 || -z "${3}" ]] && empty_comment "message" "update" || comment="${3}"
+            while (( $# > 3 )); do
+              case "${4:-}" in
+                --comment-id)  [[ $# -lt 5 || -z "${5}" ]] && empty_commentId "update" || has_nondigits "${5}" "update-comment" && commentId="${5}" || exit 1 && shift ;;
+                --comment-ids) [[ $# -lt 5 || -z "${5}" ]] && empty_commentIds "update" || commentId="${5}" && shift ;;
+                --title)       [[ $# -lt 5 || -z "${5}" ]] && empty_comment "title" "update" || title="${5}" && shift ;;
+                --type) 
+                  if [[ $# -lt 5 || -z "${5}" ]]; then 
+                    empty_comment "type" "update"
+                  else
+                    case "${5:-}" in
+                      ALERT|REPLY) COMMENT_TYPE="${5}" ;;
+                      *)           error "invalid comment type '${5}'. Valid types are: 'ALERT' (default) or 'REPLY'." && example_comment "update" ;;
+                    esac
+                  fi
+                  shift
+                  ;;
+                --config|-c) [[ $# -lt 5 || -z "${5}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${5}" && shift ;;
+                *)           invalid_option "${4}" "update" ;;  
+              esac
+              shift
+            done
+            shift
+            ;;
+          --alert-id|-i)
+            command='update-id'
+            [[ $# -lt 3 || -z "${3}" ]] && empty_number "update" || has_nondigits "${3}" "update-id" && alertId="${3}" || exit 1 && shift
+            ;;
+          --status|-s)
+            if [[ $# -lt 3 || -z "${3}" ]]; then
+              empty_status "update"
+            else
+              case "${3:-}" in
+                0|1|2|100|300|500|600|700) status="${3}" ;;
+                *)                         invalid_status "${3}" ;;
+              esac
+            fi
+            shift
+            ;;
+          --all|-A)         input='all' ;;
+          --unread)         statusCode=0   input='unread' ;;
+          --updated)        statusCode=1   input='updated' ;;
+          --false-positive) statusCode=2   input='false-positive' ;;
+          --watched)        statusCode=100 input='watched' ;;
+          --closed)         statusCode=300 input='closed' ;;
+          --reminder)       statusCode=500 input='reminder' ;;
+          --recovery)       statusCode=600 input='recovery' ;;
+          --anti-flood)     statusCode=700 input='anti-flood' ;;
+          --from)           [[ $# -lt 3 || -z "${3}" ]] && empty_epoch "from" || valid_from "${3}" && shift ;;
+          --config|-c)      [[ $# -lt 3 || -z "${3}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${3}" && shift ;;
+          --help|-h)        print_update_help && exit 0 ;;
+          *)                invalid_option "${2}" "update" ;;
+        esac
+        shift
+      done
+      [[ -z "${alertId}" && -n "${status}" && -z "${input}" ]] && missing_option "alert-id" "update-status"
+      [[ -n "${alertId}" && -n "${input}" ]] && error "${MG}--alert-id${RS} and ${MG}--${input}${RS} cannot be used together." && more_info_msg "update" 
+      [[ -z "${status}" && "${command}" == "update-id" ]] && missing_option "status" "update-status"
+      if [[ "${command}" == "update-comment" ]]; then
+        [[ -z "${commentId}" ]] && missing_option "comment-id" "update"
+        [[ -z "${title}" ]] && missing_option "title" "update"
+      fi
+      ;;
+    add)
+      command='add'
+      (( $# == 1 )) && print_add_help && exit 1
+      while (( $# > 1 )); do
+        case "${2:-}" in
+          --tag) 
+            [[ $# -lt 3 || -z "${3}" ]] && empty_string "t" "add" || input="${3}" type='tag' && shift  
+            while (( $# > 2 )); do
+              case "${3:-}" in
+                --alert-id|-i) [[ $# -lt 4 || -z "${4}" ]] && empty_number "add-tag" || has_nondigits "${4}" "add" && alertId="${4}" || exit 1 && shift ;;
+                --alert-ids)   [[ $# -lt 4 || -z "${4}" ]] && empty_ids "tag" || alertId="${4}" && shift ;;
+                --config|-c)   CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+                *)             invalid_option "${3}" "add" ;;
+              esac
+            shift  
+            done
+            [[ -z "${alertId}" ]] && missing_option "alert-id" "add-tag"
+            ;; 
+          --comment|--annotation) 
+            [[ $# -lt 3 || -z "${3}" ]] && empty_comment "message" "add" || comment="${3}" && shift
+            while (( $# > 2 )); do
+              case "${3:-}" in
+                --alert-id|-i) [[ $# -lt 4 || -z "${4}" ]] && empty_number "add-comment" || has_nondigits "${4}" "add-comment" && alertId="${4}" || exit 1 && shift ;;
+                --alert-ids)   [[ $# -lt 4 || -z "${4}" ]] && empty_ids "comment" || alertId="${4}" && shift ;;
+                --config|-c)   CFG_FLAG=true CFG_FILE="${4}" && shift ;;
+                --type) 
+                  if [[ $# -lt 4 || -z "${4}" ]]; then 
+                    empty_comment "type" "add"
+                  else
+                    case "${4:-}" in
+                      ALERT|REPLY) COMMENT_TYPE="${4}" ;;
+                      *)           error "invalid comment type '${4}'. Valid types are: 'ALERT' (default) or 'REPLY'." && example_comment "add" ;;
+                    esac
+                  fi
+                  shift
+                  ;;
+                --title) [[ $# -lt 4 || -z "${4}" ]] && empty_comment "title" "add" || title="${4}" && shift ;;
+                *)       invalid_option "${3}" "add" ;;
+              esac
+            shift
+            done
+             [[ -z "${alertId}" ]] && missing_option "id" "add-comment"
+             [[ -z "${title}" ]] && missing_option "title" "add-comment"
+            ;;
+          "")        print_add_help && exit 1 ;;
+          --help|-h) print_add_help && exit 0 ;;
+          *)         invalid_option "${2}" "add" "cmd" ;;
+        esac
+        shift
+      done
+      ;;     
+    apply)
       command='apply'
       case "${2:-}" in
-        --file | -f )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "f" "apply"
-          else
-            file="${3}"
-          fi
-          shift
-          ;;  
-        "" ) print_apply_help && exit 1 ;;
-        --help | -h ) print_apply_help && exit 0 ;;
-        *) invalid_option "${2}" "apply" ;; 
+        --file|-f) [[ $# -lt 3 || -z "${3}" ]] && empty_string "f" "apply" || file="${3}" && shift ;;  
+        "")        print_apply_help && exit 1 ;;
+        --help|-h) print_apply_help && exit 0 ;;
+        *)         invalid_option "${2}" "apply" ;; 
       esac
       shift  
       ;;
-    copy )
+    copy)
       command='copy'
       case "${2:-}" in  
-        --all | -A ) true ;;
-        --active | -a )   quantity='active' ;;
-        --inactive | -i ) quantity='inactive' ;;
-        --favorite | -F ) quantity='favorite' ;;
-        --subcategory | -s )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "s" "copy"
-          else
-            command='copy-param' input="${3}"
-          fi
-          shift
-          ;;
-        --name | -n )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "copy"
-          else
-            command='copy-param' param='name' input="${3}"
-          fi
-          shift
-          ;;
-        --id )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_number "copy"
-          else
-            if has_nondigits "${3}" "copy"; then
-              command='copy-param' param='ID' input="${3}"
-            else 
-              exit 1  
-            fi
-          fi
-          shift
-          ;;          
-        "" ) print_copy_help && exit 1 ;;
-        --help | -h ) print_copy_help && exit 0 ;;
-        *) invalid_option "${2}" "copy" ;;   
+        --all|-A)         quantity='all' ;;
+        --active|-a)      quantity='active' ;;
+        --inactive|-I)    quantity='inactive' ;;
+        --favorite|-F)    quantity='favorite' ;;
+        --subcategory|-s) [[ $# -lt 3 || -z "${3}" ]] && empty_string "s" "copy" || command='copy-param' param='subcategory' input="${3}" && shift ;;
+        --name|-n)        [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "copy" || command='copy-param' param='name' input="${3}" && shift ;;
+        --id)             [[ $# -lt 3 || -z "${3}" ]] && empty_number "copy" || has_nondigits "${3}" "copy" && command='copy-param' param='ID' input="${3}" || exit 1 && shift ;;          
+        "")               print_copy_help && exit 1 ;;
+        --help|-h)        print_copy_help && exit 0 ;;
+        *)                invalid_option "${2}" "copy" ;;   
       esac
       shift      
       ;;
-    delete )
+    delete)
       command='delete'
       case "${2:-}" in
-        --all | -A ) true ;;
-        --active | -a )   quantity='active' ;;
-        --inactive | -i ) quantity='inactive' ;;
-        --favorite | -F ) quantity='favorite' ;;
-        --subcategory | -s ) 
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "delete"
-          else
-            command='delete-param' input="${3}"
-          fi
-          shift
+        --all|-A)         quantity='all' ;;
+        --active|-a)      quantity='active' ;;
+        --inactive|-I)    quantity='inactive' ;;
+        --favorite|-F)    quantity='favorite' ;;
+        --subcategory|-s) [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "delete" || command='delete-param' param='subcategory' input="${3}" && shift ;;
+        --name|-n)        [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "delete" || command='delete-param' param='name' input="${3}" && shift ;;
+        --id)             [[ $# -lt 3 || -z "${3}" ]] && empty_number "delete" || has_nondigits "${3}" "delete" && command='delete-param' param='ID' input="${3}" || exit 1 && shift ;;
+        --comment-id) 
+          command='delete-comment'
+          [[ $# -lt 3 || -z "${3}" ]] && empty_commentId "delete" || has_nondigits "${3}" "delete-comment" && commentId="${3}" || exit 1 && shift 
           ;;
-        --name | -n ) 
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "delete"
-          else
-            command='delete-param' param='name' input="${3}"
-          fi
-          shift
+        --comment-ids)
+          command='delete-comment'
+          [[ $# -lt 3 || -z "${3}" ]] && empty_commentIds "delete" || commentId="${3}" && shift
           ;;
-        --id )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_number "delete"
-          else
-            if has_nondigits "${3}" "delete"; then
-              command='delete-param' param='ID' input="${3}"
-            else
-              exit 1
-            fi
-          fi
-          shift
-          ;;
-        "" ) print_delete_help && exit 1 ;;
-        --help | -h ) print_delete_help && exit 0 ;;
-        *) invalid_option "${2}" "delete" ;;
+        "")               print_delete_help && exit 1 ;;
+        --help|-h)        print_delete_help && exit 0 ;;
+        *)                invalid_option "${2}" "delete" ;;
       esac
       shift 
       ;;
-    enable )
+    enable)
       command='enable'
       case "${2:-}" in
-        --all | -A ) true ;;
-        --inactive | -i ) quantity='inactive' ;;
-        --subcategory | -s )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "enable"
-          else
-            command='enable-param' input="${3}"
-          fi
-          shift
-          ;;
-        --name | -n )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "enable"
-          else
-            command='enable-param' param='name' input="${3}"
-          fi
-          shift
-          ;;
-        --id )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_number "enable"
-          else
-            if has_nondigits "${3}" "enable"; then
-              command='enable-param' param='ID' input="${3}"
-            else
-              exit 1  
-            fi
-          fi
-          shift
-          ;;
-        "" ) print_enable_help && exit 1 ;;
-        --help | -h ) print_enable_help && exit 0 ;;
-        *) invalid_option "${2}" "enable" ;;  
+        --all|-A)         quantity='all' ;;
+        --inactive|-I)    quantity='inactive' ;;
+        --subcategory|-s) [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "enable" || command='enable-param' param='subcategory' input="${3}" && shift ;;
+        --name|-n)        [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "enable" || command='enable-param' param='name' input="${3}" && shift ;;
+        --id)             [[ $# -lt 3 || -z "${3}" ]] && empty_number "enable" || has_nondigits "${3}" "enable" && command='enable-param' param='ID' input="${3}" || exit 1 && shift ;;
+        "")               print_enable_help && exit 1 ;;
+        --help|-h)        print_enable_help && exit 0 ;;
+        *)                invalid_option "${2}" "enable" ;;  
       esac
       shift 
       ;;
-    disable )
+    disable)
       command='disable'
       case "${2:-}" in
-        --all | -A ) true ;;
-        --active | -a ) quantity='active' ;;
-        --subcategory | -s )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "disable"
-          else
-            command='disable-param' input="${3}"
-          fi
-          shift
-          ;;
-        --name | -n )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_string "n" "disable"
-          else
-            command='disable-param' param='name' input="${3}"
-          fi
-          shift
-          ;;
-        --id )
-          if [[ $# -lt 3 || -z "${3}" ]]; then
-            empty_number "disable"
-          else
-            if has_nondigits "${3}" "disable"; then
-              command='disable-param' param='ID' input="${3}"
-            else
-              exit 1
-            fi
-          fi
-          shift
-          ;;        
-        "" ) print_enable_help "disable" && exit 1 ;;
-        --help | -h ) print_enable_help "disable" && exit 0 ;;
-        *) invalid_option "${2}" "disable" ;;  
+        --all|-A)         quantity='all' ;;
+        --active|-a)      quantity='active' ;;
+        --subcategory|-s) [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "disable" || command='disable-param' param='subcategory' input="${3}" && shift ;;
+        --name|-n)        [[ $# -lt 3 || -z "${3}" ]] && empty_string "n" "disable" || command='disable-param' param='name' input="${3}" && shift ;;
+        --id)             [[ $# -lt 3 || -z "${3}" ]] && empty_number "disable" || has_nondigits "${3}" "disable" && command='disable-param' param='ID' input="${3}" || exit 1 && shift ;;
+        "")               print_enable_help "disable" && exit 1 ;;
+        --help|-h)        print_enable_help "disable" && exit 0 ;;
+        *)                invalid_option "${2}" "disable" ;;  
       esac
       shift
       ;;       
-    --help | -h | help ) print_usage && exit 0 ;;
-    --version | -V | version ) grep '^#/' <"$0" | cut -c4- && exit 0 ;;
-    *) 
-      error "Invalid command '${1}'."
-      echo "Try '${PROGRAM} help' for more information."
-      exit 1
-      ;;
+    --help|-h|help)       print_usage && exit 0 ;;
+    --version|-V|version) grep '^#/' <"$0" | cut -c4- && exit 0 ;;
+    *)                    invalid_option "${1}" "global" "cmd" ;;
   esac
   shift
 done
 
 
-# Check if a Devo 'cloud' value was provided and if it's valid
+# Global health checks (config file, cloud, and token)
+if [[ "${CFG_FLAG}" = true ]]; then
+  read_config "${CFG_FILE}"
+else
+  read_config_from_dir
+fi
+
 if [[ -z "${DEVO_CLOUD}" ]]; then
   invalid_cloud && exit 1
 else
   case "${DEVO_CLOUD}" in
-    us | eu | es | saas | ca | sasr ) true ;;  
+    us|eu|ca|sasr|apac) true ;;  
     *) invalid_cloud && exit 1 ;;
   esac
 fi
 
-# Check if a Devo 'token' value was provided
 [[ -z "${DEVO_TOKEN}" ]] && empty_token "token"
 
-declare -r ALERTS_ENDPOINT=https://api-${DEVO_CLOUD}.devo.com/alerts/v1/alertDefinitions
+
+declare -r BASE_URL=https://api-${DEVO_CLOUD}.devo.com/alerts/v1
+declare -r ALERT_DEFINITIONS_URL=${BASE_URL}/alertDefinitions
 declare -r PAGE='?page=0&size=1000'
+declare -r ALERTS_URL=${BASE_URL}/alerts
+declare -r COMMENTS_URL=${BASE_URL}/comments
+declare -r TAGS_URL=${BASE_URL}/tags
 
-# Confirm if the Alerting API endpoint works
-response=$(curl -sS "${ALERTS_ENDPOINT}" 2>&1 || true)
-[[ "${response}" =~ "curl:" ]] && error "${response}" && exit 1
+# Confirm if the Alerts API endpoint works
+ok=$(curl -s "${BASE_URL}/canary" -H "standAloneToken: ${DEVO_TOKEN}")
+no_error "${ok}" && true || exit 1
  
-# Retrieve the Devo domain using the token provided
-[[ -z "${DEVO_DOMAIN}" ]] && DEVO_DOMAIN=$(get_domain_from_alerts "${DEVO_TOKEN}")
-
-
-# Get all alerts by default
-arg=$(get_all_alerts)
 
 case "${quantity}" in
-  active )   arg=$(get_active_alerts "true") ;;
-  inactive ) arg=$(get_active_alerts "false") ;;
-  favorite ) arg=$(get_favorite_alerts) ;;
+  all)      arg=$(get_all_alerts) ;;
+  active)   arg=$(get_active_alerts "true") ;;
+  inactive) arg=$(get_active_alerts "false") ;;
+  favorite) arg=$(get_favorite_alerts) ;;
 esac
 
 case "${param}" in
-  subcategory ) args=$(get_alerts_by_subcategory "${input}") ;;
-  name )        args=$(get_alerts_by_name "${input}") ;;
-  ID )          args=$(get_alert_by_id "${input}") ;;
+  subcategory) args=$(get_alerts_by_subcategory "${input}") ;;
+  name)        args=$(get_alerts_by_name        "${input}") ;;
+  ID)          args=$(get_alert_by_id           "${input}") ;;
+  alertID)     args=$(get_triggered_alert_by_id "${input}") ;;
 esac
 
 case "${command}" in
-  get ) 
+  get) 
     start_msg "Listing" "${quantity}" "${alertType}"
     case "${alertType}" in
-      definitions )   get_alert_definitions "${arg}" ;;
-      names )         get_alert_names "${arg}" ;;
-      subcategories ) get_subcategory_names "${arg}" ;;
+      definitions)   get_alert_definitions "${arg}" ;;
+      triggered)     get_triggered_alerts  "$(get_all_triggered_alerts)" ;;
+      names)         get_alert_names       "${arg}" ;;
+      subcategories) get_subcategory_names "${arg}" ;;
+      queries)       get_alert_queries     "${arg}" ;;
     esac 
     ;;
-  get-param )
-    start_msg_param "Listing" "${alertType}" "${param}" "${input}"
-    get_alert_definitions "${args}" "${param}" "${input}"
+  get-param)
+    case "${alertType}" in
+      triggered) 
+        start_msg_param "Listing" "${alertType}" "ID" "${input}"
+        get_triggered_alert "${args}" "${input}" 
+        ;;
+      comments) get_comments "$(get_triggered_alerts_ids "comment")" ;;  
+      *)
+        start_msg_param "Listing" "${alertType}" "${param}" "${input}"
+        get_alert_definitions "${args}" "${param}" "${input}" 
+        ;;
+    esac
     ;;
-  apply ) apply_alert "${file}" ;;
-  copy | delete | enable | disable ) start_msg "Searching" "${quantity}" ;;&
-  copy )    copy_alerts "${arg}" ;;
-  delete )  delete_alerts "${arg}" ;;
-  enable )  enable_alerts "${arg}" ;;
-  disable ) enable_alerts "${arg}" "false" ;;
-  copy-param | delete-param | enable-param | disable-param ) start_msg_param "Searching" "${param}" "${input}" ;;&
-  copy-param )    copy_alerts "${args}" ;;
-  delete-param )  delete_alerts "${args}" ;;
-  enable-param )  enable_alerts "${args}" ;;
-  disable-param ) enable_alerts "${args}" "false" ;;
+  status) 
+    start_msg_status "Listing" "${alertType}"
+    get_triggered_alerts_status "$(get_all_triggered_alerts_status)"
+    ;;
+  update-id)
+    start_msg_update_id "${alertId}" "${status}"
+    update_alert_status "${alertId}" "${status}"
+    ;;
+  update-comment) update_comments "${commentId}" "${comment}" "${title}" "${COMMENT_TYPE}" ;;
+  update)
+    start_msg_update "${input}" "${status}"
+    if [[ -z "${statusCode}" ]]; then
+      argStatusList=$(get_triggered_alerts_ids)
+    else
+      argStatusList=$(get_triggered_alerts_ids "${statusCode}")
+    fi  
+    update_alert_status_list "${status}" "${argStatusList}" "${input}"
+    ;;
+  add) 
+    if [[ "${type}" == "tag" ]]; then
+      add_tag "${alertId}" "${input}"
+    else 
+      add_comments "${alertId}" "${comment}" "${title}" "${COMMENT_TYPE}" 
+    fi
+    ;;    
+  apply)          apply_alert "${file}" ;;
+  copy)           copy_alerts "${arg}" ;;
+  delete)         delete_alerts "${arg}" ;;
+  delete-comment) delete_comments "${commentId}" ;;
+  enable)         enable_alerts "${arg}" ;;
+  disable)        enable_alerts "${arg}" "false" ;;
+  copy-param)     copy_alerts   "${args}" ;;
+  delete-param)   delete_alerts "${args}" ;;
+  enable-param)   enable_alerts "${args}" ;;
+  disable-param)  enable_alerts "${args}" "false" ;;
 esac
