@@ -1898,10 +1898,6 @@ declare -r ALERTS_URL=${BASE_URL}/alerts
 declare -r COMMENTS_URL=${BASE_URL}/comments
 declare -r TAGS_URL=${BASE_URL}/tags
 
-# Confirm if the Alerts API endpoint works
-ok=$(curl -s "${BASE_URL}/canary" -H "standAloneToken: ${DEVO_TOKEN}")
-no_error "${ok}" && true || exit 1
- 
 
 case "${quantity}" in
   all)      arg=$(get_all_alerts) ;;
