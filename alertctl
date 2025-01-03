@@ -119,7 +119,7 @@ ${B_WHITE}Commands:${NC}
   disable                   Disable an alert definition
   delete                    Delete an alert definition or a comment
   get                       List triggered alerts or alert definitions
-  update                    Update alert status or comment by its ID
+  update                    Update alert status, priority or comment by its ID
   status                    Get alert status of a list of triggered alerts
 
   help                      Show help menu
@@ -404,7 +404,7 @@ STATUSCOMMAND
 print_update_help() {
   echo -e "$(
   cat << UPDATECOMMAND
-Update alert status or comment by its ID.
+Update alert status, priority or comment by its ID.
 
   USAGE: ${APP_CMD} update [options]
 
@@ -428,6 +428,12 @@ ${OPTS}
       ${MG}--reminder${RS}             Update status of reminder alerts
       ${MG}--recovery${RS}             Update status of recovery alerts
       ${MG}--anti-flood${RS}           Update status of anti-flood alerts
+  ${MG}-p${RS}, ${MG}--priority${RS} NUMBER      New priority code of the alert. Valid codes include: 
+                               0,1    = Very Low
+                               2,3    = Low
+                               4,5    = Normal
+                               6,7    = High
+                               8,9,10 = Very High
       ${MG}--from${RS} NUMBER          List all triggered alerts after this date. Epoch date in millisecs (e.g. 1669852800000) 
                                or a relative date (e.g. 3d, 12h, 15m, etc). Default: 24h
 
@@ -448,6 +454,9 @@ ${APP_CMD} update ${MG}--all --status${RS} 300 ${MG}--from${RS} 6h
 
 ${GY}# update closed alerts to status 0 (unread) from the last 15 days${NC}
 ${APP_CMD} update ${MG}--closed --status${RS} 0 ${MG}--from${RS} 15d
+
+${GY}# update alert with ID 137861977 to priority 6 (high)${NC}
+${APP_CMD} update ${MG}--alert-id${RS} 137861977 ${MG}--priority${RS} 6
 
 ${GY}# update comment with ID 578969
 ${APP_CMD} update ${MG}--comment${RS} ${YW}"Updated message"${RS} ${MG}--comment-id${RS} 578969 ${MG}--title${RS} ${YW}"New Title"${RS}
@@ -699,6 +708,11 @@ start_msg_update_id() {
 }
 
 
+start_msg_update_priority() {
+  echo -e "${INFO} Updating alert with ID ${CY}${1}${RS} to priority ${CY}${2}${RS}"
+}
+
+
 start_msg_update() {
   echo -e "${INFO} Updating ${1} alerts to status ${CY}${2}${RS}"
 }
@@ -909,6 +923,11 @@ invalid_status() {
 }
 
 
+empty_priority() {
+  error "priority code not provided. Please enter a valid alert priority [1,10]:" && priority_list
+}
+
+
 missing_option() {
   error "${MG}--${1}${RS} option is required.\n\n${EXAMPLE}"
   case "${2}" in
@@ -938,6 +957,12 @@ missing_file() {
 status_list() {
   echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\nReminder\t= 500\nRecovery\t= 600\nAnti-Flood\t= 700
 \n${EXAMPLE}\n${GY}# close alert with ID 851964${NC}\n${APP_CMD} ${1} ${ALERT_ID_FG} 851964 ${MG}--status${RS} 300" && exit 1
+}
+
+
+priority_list() {
+  echo -e "Very Low\t= 0,1\nLow\t\t= 2,3\nNormal\t\t= 4,5\nHigh\t\t= 6,7\nVery High\t= 8,9,10
+\n${EXAMPLE}\n${GY}# set priority of alert with ID 851964 to 6 (High)${NC}\n${APP_CMD} update ${ALERT_ID_FG} 851964 ${MG}--priority${RS} 6" && exit 1
 }
 
 
@@ -996,7 +1021,7 @@ has_nondigits_triggered() {
 
 
 invalid_cloud() {
-  error "invalid Devo cloud. Please use one of the supported clouds: us, eu, ca, sasr, or apac." && exit 1
+  error "invalid Devo cloud. Please use one of the supported clouds: [us, us3, eu, ca, apac, sasr]." && exit 1
 }
 
 
@@ -1113,6 +1138,16 @@ update_alert_status_list() {
   else
     [[ "${3}" == "all" ]] && echo -e "${CROSS} No alerts found." || echo -e "${CROSS} No ${3} alerts found."
   fi
+}
+
+
+update_alert_priority() {
+  local stdout
+  stdout=$(curl -sS --connect-timeout 10 \
+                -X PUT "${ALERTS_URL}/${1}/priority?priority=${2}" \
+                -H "standAloneToken: ${DEVO_TOKEN}" \
+                -H "Content-Type: application/json")
+  no_error "${stdout}" && echo -e "${TICK} ${GR}Alert priority successfully updated.${RS}"           
 }
 
 
@@ -1499,6 +1534,7 @@ comment=''
 title=''
 status=''
 statusCode=''
+priority=''
 
 
 while (( $# > 0 )); do
@@ -1711,6 +1747,15 @@ while (( $# > 0 )); do
             fi
             shift
             ;;
+          --priority|-p)
+            command='update-priority'
+            if [[ $# -lt 3 || -z "${3}" ]]; then
+              empty_priority 
+            else
+              priority="${3}"
+            fi
+            shift
+            ;;  
           --all|-A)         input='all' ;;
           --unread)         statusCode=0   input='unread' ;;
           --updated)        statusCode=1   input='updated' ;;
@@ -1728,7 +1773,8 @@ while (( $# > 0 )); do
         shift
       done
       [[ -z "${alertId}" && -n "${status}" && -z "${input}" ]] && missing_option "alert-id" "update-status"
-      [[ -n "${alertId}" && -n "${input}" ]] && error "${MG}--alert-id${RS} and ${MG}--${input}${RS} cannot be used together." && more_info_msg "update" 
+      [[ -n "${alertId}" && -n "${input}" ]] && error "${MG}--alert-id${RS} and ${MG}--${input}${RS} cannot be used together." && more_info_msg "update"
+      [[ -n "${status}" && -n "${priority}" ]] && error "${MG}--status${RS} and ${MG}--priority${RS} cannot be used together." && more_info_msg "update"
       [[ -z "${status}" && "${command}" == "update-id" ]] && missing_option "status" "update-status"
       if [[ "${command}" == "update-comment" ]]; then
         [[ -z "${commentId}" ]] && missing_option "comment-id" "update"
@@ -1883,7 +1929,7 @@ if [[ -z "${DEVO_CLOUD}" ]]; then
   invalid_cloud && exit 1
 else
   case "${DEVO_CLOUD}" in
-    us|eu|ca|sasr|apac) true ;;  
+    us|us3|eu|ca|sasr|apac) true ;;  
     *) invalid_cloud && exit 1 ;;
   esac
 fi
@@ -1945,6 +1991,10 @@ case "${command}" in
     start_msg_update_id "${alertId}" "${status}"
     update_alert_status "${alertId}" "${status}"
     ;;
+  update-priority)
+    start_msg_update_priority "${alertId}" "${priority}"
+    update_alert_priority "${alertId}" "${priority}"
+    ;;  
   update-comment) update_comments "${commentId}" "${comment}" "${title}" "${COMMENT_TYPE}" ;;
   update)
     start_msg_update "${input}" "${status}"
