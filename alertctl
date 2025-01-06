@@ -416,9 +416,7 @@ ${OPTS}
                                2   = False Positive
                                100 = Watched
                                300 = Closed
-                               500 = Reminder
-                               600 = Recovery
-                               700 = Anti-flood
+                               800 = Suppressed
   ${MG}-A${RS}, ${MG}--all${RS}                  Update status of all triggered alerts
       ${MG}--unread${RS}               Update status of unread alerts
       ${MG}--updated${RS}              Update status of updated alerts
@@ -955,7 +953,7 @@ missing_file() {
 
 
 status_list() {
-  echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\nReminder\t= 500\nRecovery\t= 600\nAnti-Flood\t= 700
+  echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\Suppressed\t= 800
 \n${EXAMPLE}\n${GY}# close alert with ID 851964${NC}\n${APP_CMD} ${1} ${ALERT_ID_FG} 851964 ${MG}--status${RS} 300" && exit 1
 }
 
@@ -1204,13 +1202,13 @@ get_triggered_alerts_status() {
 get_alerts_status_summary() {
   local results cnt total=0 tab='\t'
   results=$(jq 'to_entries | group_by(.value) | map(.[0]+{count:length})' <<< "${1}")
-  for i in 2 500 600 700; do
+  for i in 2 800; do
     cnt=$(jq '.[] | select(.value=='"${i}"').count' <<< "${results}")
     total=$(( total + cnt ))
   done
   (( total > 0 )) && tab='\t\t'
   echo -e "STATUS${tab}CODE\tALERTS"
-  for status in 0 1 2 100 300 500 600 700; do
+  for status in 0 1 2 100 300 800; do
     cnt=$(jq '.[] | select(.value=='"${status}"').count' <<< "${results}")
     if [[ -n "${cnt}" ]]; then
       case "${status}" in
@@ -1219,9 +1217,7 @@ get_alerts_status_summary() {
         2)   echo -e "False-positive\t${status}\t${cnt}" ;;
         100) echo -e "Watched${tab}${status}\t${cnt}" ;;
         300) echo -e "Closed${tab}${status}\t${cnt}" ;; 
-        500) echo -e "Reminder\t${status}\t${cnt}" ;;
-        600) echo -e "Recovery\t${status}\t${cnt}" ;;
-        700) echo -e "Anti-flood\t${status}\t${cnt}" ;;
+        800) echo -e "Suppressed${tab}${status}\t${cnt}" ;;
       esac
     fi
   done
@@ -1741,7 +1737,7 @@ while (( $# > 0 )); do
               empty_status "update"
             else
               case "${3:-}" in
-                0|1|2|100|300|500|600|700) status="${3}" ;;
+                0|1|2|100|300|800) status="${3}" ;;
                 *)                         invalid_status "${3}" ;;
               esac
             fi
@@ -1762,9 +1758,7 @@ while (( $# > 0 )); do
           --false-positive) statusCode=2   input='false-positive' ;;
           --watched)        statusCode=100 input='watched' ;;
           --closed)         statusCode=300 input='closed' ;;
-          --reminder)       statusCode=500 input='reminder' ;;
-          --recovery)       statusCode=600 input='recovery' ;;
-          --anti-flood)     statusCode=700 input='anti-flood' ;;
+          --suppressed)     statusCode=800 input='suppressed' ;;
           --from)           [[ $# -lt 3 || -z "${3}" ]] && empty_epoch "from" || valid_from "${3}" && shift ;;
           --config|-c)      [[ $# -lt 3 || -z "${3}" ]] && missing_file || CFG_FLAG=true CFG_FILE="${3}" && shift ;;
           --help|-h)        print_update_help && exit 0 ;;
