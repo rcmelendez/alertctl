@@ -86,6 +86,7 @@ declare -r EXAMPLES=${B_WHITE}Examples:${NC}
 declare -r ID_FG=${MG}--id${RS}
 declare -r ALERT_ID_FG=${MG}--alert-id${RS}
 declare -r TAG_NAME=${MG}--name${RS}
+declare -r CONTENT_TYPE='Content-Type: application/json'
 declare -a idList
 
 
@@ -1040,7 +1041,7 @@ get_all_alerts() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERT_DEFINITIONS_URL}${PAGE}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"    
+       -H "${CONTENT_TYPE}"    
 }
 
 
@@ -1048,7 +1049,7 @@ get_all_triggered_alerts() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERTS_URL}/list?limit=${LIMIT}&offset=${OFFSET}&from=${FROM}&to=${NOW}&showAll=${SHOW_ALL}&orderby=${ORDER_BY}&orderasc=${ORDER_ASC}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"    
+       -H "${CONTENT_TYPE}"    
 }
 
 
@@ -1069,7 +1070,7 @@ get_alerts_by_name() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERT_DEFINITIONS_URL}?nameFilter=${name}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"
+       -H "${CONTENT_TYPE}"
 }
 
 
@@ -1083,7 +1084,7 @@ get_alert_by_id() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERT_DEFINITIONS_URL}?idFilter=${1}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"  
+       -H "${CONTENT_TYPE}"  
 }
 
 
@@ -1091,7 +1092,7 @@ get_triggered_alert_by_id() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERTS_URL}/get?id=${1}&annotations=${ANNOTATIONS}&tags=${TAGS}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"
+       -H "${CONTENT_TYPE}"
 }
 
 
@@ -1099,7 +1100,7 @@ get_all_triggered_alerts_status() {
   curl -sS --connect-timeout 10 \
        -X GET "${ALERTS_URL}/listStatus?from=${FROM}" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json"
+       -H "${CONTENT_TYPE}"
 }
 
 
@@ -1107,7 +1108,7 @@ get_all_comments() {
   curl -sS --connect-timeout 10 \
        -X POST "${COMMENTS_URL}/list" \
        -H "standAloneToken: ${DEVO_TOKEN}" \
-       -H "Content-Type: application/json" \
+       -H "${CONTENT_TYPE}" \
        -d "${1}"
 }
 
@@ -1117,7 +1118,7 @@ update_alert_status() {
   stdout=$(curl -sS --connect-timeout 10 \
                 -X PUT "${ALERTS_URL}/updateStatus?id=${1}&status=${2}" \
                 -H "standAloneToken: ${DEVO_TOKEN}" \
-                -H "Content-Type: application/json")
+                -H "${CONTENT_TYPE}")
   if jq -e 'has("error")' &>/dev/null <<< "${stdout}"; then
     err=$(jq -r '.error.message' <<< "${stdout}") && error "${err,}." && exit 1
   else
@@ -1134,7 +1135,7 @@ update_alert_status_list() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X PUT "${ALERTS_URL}/updateStatusList?status=${1}" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d "${2}")
     if [[ $(get_length "${stdout}") == 0 ]]; then
       (( list > 1 )) && msg='alerts'
@@ -1151,7 +1152,7 @@ update_alert_priority() {
   stdout=$(curl -sS --connect-timeout 10 \
                 -X PUT "${ALERTS_URL}/${1}/priority?priority=${2}" \
                 -H "standAloneToken: ${DEVO_TOKEN}" \
-                -H "Content-Type: application/json")
+                -H "${CONTENT_TYPE}")
   no_error "${stdout}" && echo -e "${TICK} ${GR}Alert priority successfully updated.${RS}"           
 }
 
@@ -1311,7 +1312,7 @@ apply_alert() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X "${method}" "${ALERT_DEFINITIONS_URL}" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d @"${1}")
     no_error "${stdout}" && echo -e "${TICK} ${GR}Alert definition successfully ${msg}ed.${RS}"
   fi
@@ -1328,7 +1329,7 @@ update_comments() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X PUT "${COMMENTS_URL}/bulk/update" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d '{"idMap":{"":['"${commentIds}"']},"commentMsg":"'"${2}"'","commentTitle":"'"${3}"'","commentType":"'"${4}"'"}')
     if no_error "${stdout}"; then
       if [[ "${#idList[@]}" == 1 ]]; then
@@ -1351,7 +1352,7 @@ add_tag() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X PUT "${TAGS_URL}" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d '{"alertIds":['"${alertIds%,}"'],"tags":["'"${2}"'"]}')
     if no_error "${stdout}"; then
       if [[ "${#ids[@]}" != "${#idList[@]}" ]]; then
@@ -1373,7 +1374,7 @@ add_comments() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X POST "${COMMENTS_URL}/bulk/add" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d '{"elementIds":['"${alertIds}"'],"commentMsg":"'"${2}"'","commentTitle":"'"${3}"'","commentType":"'"${4}"'"}')
     if no_error "${stdout}"; then
       if [[ "${#idList[@]}" == 1 ]]; then
@@ -1401,7 +1402,7 @@ post_alerts() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X POST "${ALERT_DEFINITIONS_URL}" \
                   -H "standAloneToken: ${DEVO_TARGET_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d ''"${payload}"'')
     if jq -e 'has("error")' &>/dev/null <<< "${stdout}"; then
       (( err++ )) || true
@@ -1466,7 +1467,7 @@ delete_alerts() {
         stdout=$(curl -sS --connect-timeout 10 \
                       -X DELETE "${ALERT_DEFINITIONS_URL}?${alertIds}" \
                       -H "standAloneToken: ${DEVO_TOKEN}" \
-                      -H "Content-Type: application/json")
+                      -H "${CONTENT_TYPE}")
         if no_error "${stdout}"; then 
           echo -e "${TICK} ${GR}Alert ${msg} successfully deleted.${RS}"
         fi  
@@ -1486,7 +1487,7 @@ delete_comments() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X DELETE "${COMMENTS_URL}/delete" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json" \
+                  -H "${CONTENT_TYPE}" \
                   -d "[${commentIds}]")
     if no_error "${stdout}"; then
       if [[ "${#idList[@]}" == 1 ]]; then
@@ -1518,7 +1519,7 @@ enable_alerts() {
     stdout=$(curl -sS --connect-timeout 10 \
                   -X PUT "${ALERT_DEFINITIONS_URL}/status?${alertIds}" \
                   -H "standAloneToken: ${DEVO_TOKEN}" \
-                  -H "Content-Type: application/json")
+                  -H "${CONTENT_TYPE}")
     no_error "${stdout}" && echo -e "${TICK} ${GR}Alert ${msg} successfully ${prefix}abled.${RS}"
   fi    
 }
