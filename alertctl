@@ -33,7 +33,7 @@
 # }  
 #
 # Valid keys:
-# - cloud         -> Devo cloud (e.g. us, eu, ca, sasr, or apac)
+# - cloud         -> Devo cloud (e.g. us, us3, eu, ca, sasr, or apac)
 # - token         -> Devo token associated with your domain
 # - targetToken   -> Devo token from the target domain (only required to copy alerts)
 #
@@ -851,6 +851,12 @@ example_comment() {
 }
 
 
+example_update() {
+  echo -e "\n${EXAMPLE}\n${GY}# update alert with ID 1552348 to status 300 (closed)${RS}\n${APP_CMD} update ${ALERT_ID_FG} 1552348 ${MG}--status${RS} 300
+\n${GY}# update alert with ID 1614785 to priority 9 (very high)${RS}\n${APP_CMD} update ${ALERT_ID_FG} 1614785 ${MG}--priority${RS} 9" && exit 1
+}
+
+
 empty_string() {
   case "${1}" in
     s)
@@ -894,8 +900,9 @@ empty_commentIds() {
 empty_number() {
   error "alert ID not provided. Please enter a valid number."
   [[ "${1}" == "add-tag" ]] && example_tag
-  [[ "${1}" == "add-comment" ]] && example_comment "add"  
-  echo -e "\n${EXAMPLE}\n${APP_CMD} ${1} ${ID_FG} 169820" && exit 1
+  [[ "${1}" == "add-comment" ]] && example_comment "add"
+  [[ "${1}" == "update" ]] && example_update
+  echo -e "\n${EXAMPLE}\n${APP_CMD} ${1} ${ID_FG} 2398204" && exit 1
 }
 
 
@@ -953,7 +960,7 @@ missing_file() {
 
 
 status_list() {
-  echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\Suppressed\t= 800
+  echo -e "Unread\t\t= 0\nUpdated\t\t= 1\nFalse Positive\t= 2\nWatched\t\t= 100\nClosed\t\t= 300\nSuppressed\t= 800
 \n${EXAMPLE}\n${GY}# close alert with ID 851964${NC}\n${APP_CMD} ${1} ${ALERT_ID_FG} 851964 ${MG}--status${RS} 300" && exit 1
 }
 
@@ -1000,13 +1007,13 @@ empty_token() {
 
 
 has_nondigits() {
-  local msg=${ID_FG} cmd=${2}
+  local cmd=${2}
   if [[ "${1}" =~ [^[:digit:]] ]]; then
     error "invalid ID '${1}'. IDs can only have numbers."
     [[ "${cmd}" == "add" ]] && example_tag
     [[ "${cmd}" =~ "comment" ]] && example_comment "${2:0:-8}"
-    [[ "${cmd}" =~ "id" ]] && msg=${ALERT_ID_FG} cmd=${2:0:-3}
-    echo -e "\n${EXAMPLE}\n${APP_CMD} ${cmd} ${msg} 169820" && return 1
+    [[ "${cmd}" =~ "update" ]] && example_update
+    [[ "${cmd}" == "get-id" ]] && echo -e "\n${EXAMPLE}\n${APP_CMD} ${cmd%-*} ${ALERT_ID_FG} 169820" && return 1
   fi
 }
 
@@ -1729,16 +1736,16 @@ while (( $# > 0 )); do
             shift
             ;;
           --alert-id|-i)
-            command='update-id'
             [[ $# -lt 3 || -z "${3}" ]] && empty_number "update" || has_nondigits "${3}" "update-id" && alertId="${3}" || exit 1 && shift
             ;;
           --status|-s)
+            command='update-id'
             if [[ $# -lt 3 || -z "${3}" ]]; then
               empty_status "update"
             else
               case "${3:-}" in
                 0|1|2|100|300|800) status="${3}" ;;
-                *)                         invalid_status "${3}" ;;
+                *)                 invalid_status "${3}" ;;
               esac
             fi
             shift
@@ -1769,7 +1776,6 @@ while (( $# > 0 )); do
       [[ -z "${alertId}" && -n "${status}" && -z "${input}" ]] && missing_option "alert-id" "update-status"
       [[ -n "${alertId}" && -n "${input}" ]] && error "${MG}--alert-id${RS} and ${MG}--${input}${RS} cannot be used together." && more_info_msg "update"
       [[ -n "${status}" && -n "${priority}" ]] && error "${MG}--status${RS} and ${MG}--priority${RS} cannot be used together." && more_info_msg "update"
-      [[ -z "${status}" && "${command}" == "update-id" ]] && missing_option "status" "update-status"
       if [[ "${command}" == "update-comment" ]]; then
         [[ -z "${commentId}" ]] && missing_option "comment-id" "update"
         [[ -z "${title}" ]] && missing_option "title" "update"
