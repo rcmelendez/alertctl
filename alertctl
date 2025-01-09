@@ -50,13 +50,13 @@
 # 3. Environment variables
 #
 #
-#/ Version:  1.1.0
+#/ Version:  1.2.0
 #/ Author:   Roberto Meléndez  [Cambridge, USA]
 #/ GitHub:   https://github.com/rcmelendez/alertctl
 #/ API Doc:  https://docs.devo.com/space/latest/95128644
 #/ Contact:  @rcmelendez on LinkedIn, Medium, and GitHub
 #/ Released: Feb 22, 2022
-#/ Updated:  March 11, 2023
+#/ Updated:  January 9, 2025
 
 
 set -euo pipefail
